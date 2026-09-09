@@ -1,6 +1,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from jkquant.backtest.strategy_suite import STRATEGIES, run_event_strategy
 
@@ -27,9 +28,14 @@ def test_profit_threshold_is_recorded_and_sold() -> None:
     assert len(events) == 1
     assert events.iloc[0]["event"] == "盈利达到20%"
     assert len(closed) == 1
-    assert closed.iloc[0]["exit_reason"] == "盈利达到30%止盈"
-    assert closed.iloc[0]["exit_price"] == 130
-    assert metrics["profit_take_30_count"] == 1
+    assert closed.iloc[0]["exit_reason"] == "盈利达到20%止盈"
+    assert closed.iloc[0]["exit_price"] == 120
+    assert events.iloc[0]["final_exit_reason"] == "盈利达到20%止盈"
+    assert events.iloc[0]["final_net_return"] == pytest.approx(0.2)
+    assert metrics["take_profit_count"] == 1
+    assert metrics["total_trade_count"] == 1
+    assert metrics["profitable_trade_count"] == 1
+    assert metrics["losing_trade_count"] == 0
     assert not result.empty
 
 
@@ -52,3 +58,11 @@ def test_consecutive_strategy_waits_for_three_signals() -> None:
     assert result.loc[result["trade_date"].eq("2025-09-04"), "holdings"].iloc[0] == 1
     assert trades.iloc[0]["entry_date"] == date(2025, 9, 4)
     assert metrics["open_positions"] == 1
+
+
+def test_new_equal_weight_strategies_are_registered() -> None:
+    specs = {spec.strategy_id: spec for spec in STRATEGIES}
+    assert len(specs) == 11
+    assert (specs["s09_top3_equal_exit10"].entry_rank, specs["s09_top3_equal_exit10"].exit_rank) == (3, 10)
+    assert specs["s10_top5_equal_exit10"].weighting == "equal"
+    assert (specs["s11_top5_streak2_exit10"].consecutive_rank, specs["s11_top5_streak2_exit10"].consecutive_days) == (5, 2)

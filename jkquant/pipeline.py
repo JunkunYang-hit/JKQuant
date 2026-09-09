@@ -280,7 +280,7 @@ def run_strategy_suite(
     )
     costs = config["backtest"]["cost"]
     initial_cash = float(config["backtest"]["initial_cash"])
-    take_profit = float(settings.get("take_profit", 0.30))
+    take_profit = float(settings.get("take_profit", 0.20))
     record_profit = float(settings.get("record_profit", 0.20))
     root = resolve_path(
         config, settings.get("output_dir", "backtests/strategy_suite")
@@ -291,10 +291,12 @@ def run_strategy_suite(
         "strategy_id": "baseline_top10_3d",
         "strategy_name": "基准：Top10线性权重，每3日调仓",
         "strategy_description": "固定持有Top10并按排名线性分配权重，每3个交易日重新选股调仓。",
-        "threshold_enabled": False, "profit_take_30_count": 0,
+        "threshold_enabled": False, "take_profit_count": 0,
         "crossed_20_count": 0, "completed_trades": int(len(baseline.trades)),
+        "total_trade_count": None, "profitable_trade_count": None,
+        "losing_trade_count": None, "flat_trade_count": None,
         "open_positions": int(baseline.daily["holdings"].iloc[-1]),
-        "average_holding_days": 0.0, "profitable_trade_rate": 0.0,
+        "average_holding_days": 0.0, "profitable_trade_rate": None,
     })
     baseline_folder = root / "baseline_top10_3d"
     write_strategy_result(

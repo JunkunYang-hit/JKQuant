@@ -33,6 +33,9 @@ STRATEGIES = [
     StrategySpec("s06_top20_streak2", "连续2次Top20，跌出Top20卖出", "连续2个交易日进入Top20后等权买入，跌出Top20卖出。", 20, 20, 20, 2, "equal"),
     StrategySpec("s07_top10_streak2_exit20", "Top10且连续2次Top20，跌出Top20卖出", "按排名线性加权买入Top10且连续2次进入Top20的股票，跌出Top20卖出。", 10, 20, 20, 2, "rank_linear"),
     StrategySpec("s08_top5_streak2_exit20", "Top5且连续2次Top20，跌出Top20卖出", "按排名线性加权买入Top5且连续2次进入Top20的股票，跌出Top20卖出。", 5, 20, 20, 2, "rank_linear"),
+    StrategySpec("s09_top3_equal_exit10", "当日Top3等权，跌出Top10卖出", "等权买入当日Top3，跌出Top10卖出；没有标的时持有现金。", 3, 10, None, 1, "equal"),
+    StrategySpec("s10_top5_equal_exit10", "当日Top5等权，跌出Top10卖出", "等权买入当日Top5，跌出Top10卖出；没有标的时持有现金。", 5, 10, None, 1, "equal"),
+    StrategySpec("s11_top5_streak2_exit10", "连续2次Top5等权，跌出Top10卖出", "等权买入连续2个交易日进入Top5的股票，跌出Top10卖出；没有标的时持有现金。", 5, 10, 5, 2, "equal"),
 ]
 
 
@@ -47,16 +50,24 @@ def _entry_weights(candidates: list[tuple[str, int]], spec: StrategySpec) -> dic
 
 
 def _signal_snapshots(rankings: pd.DataFrame, spec: StrategySpec) -> dict[date, dict[str, Any]]:
+    streak5: dict[str, int] = {}
     streak20: dict[str, int] = {}
     streak50: dict[str, int] = {}
     snapshots: dict[date, dict[str, Any]] = {}
     for trade_date, day in rankings.sort_values(["trade_date", "rank"]).groupby("trade_date"):
         ranks = day.set_index("ts_code")["rank"].astype(int).to_dict()
+        current5 = {code for code, rank in ranks.items() if rank <= 5}
         current20 = {code for code, rank in ranks.items() if rank <= 20}
         current50 = set(ranks)
+        streak5 = {code: streak5.get(code, 0) + 1 for code in current5}
         streak20 = {code: streak20.get(code, 0) + 1 for code in current20}
         streak50 = {code: streak50.get(code, 0) + 1 for code in current50}
-        required = streak20 if spec.consecutive_rank == 20 else streak50
+        if spec.consecutive_rank == 5:
+            required = streak5
+        elif spec.consecutive_rank == 20:
+            required = streak20
+        else:
+            required = streak50
         snapshots[trade_date] = {"ranks": ranks, "streaks": required.copy()}
     return snapshots
 
@@ -70,10 +81,10 @@ def run_event_strategy(
     end_date: date,
     initial_cash: float,
     costs: dict[str, float],
-    take_profit: float = 0.30,
+    take_profit: float = 0.20,
     record_profit: float = 0.20,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Run one daily signal/next-open execution strategy with 20%/30% events."""
+    """Run one daily signal/next-open execution strategy with a profit target."""
     market_data = daily[
         daily["trade_date"].dt.date.between(start_date, end_date)
     ].copy()
@@ -86,6 +97,7 @@ def run_event_strategy(
     daily_records: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
+    trade_sequence = 0
     buy_rate = float(costs["commission_buy"]) + float(costs["slippage"])
     sell_rate = (
         float(costs["commission_sell"])
@@ -100,7 +112,8 @@ def run_event_strategy(
             return
         position["crossed20_date"] = event_date.date().isoformat()
         events.append({
-            "strategy_id": spec.strategy_id, "event": record_label,
+            "strategy_id": spec.strategy_id, "trade_id": position["trade_id"],
+            "event": record_label,
             "ts_code": code, "name": names.get(code, ""),
             "entry_date": position["entry_date"], "event_date": event_date.date(),
             "holding_period": f"{position['entry_date']} 至 {event_date.date()}",
@@ -120,7 +133,8 @@ def run_event_strategy(
         cash += gross - fee
         net_return = (gross - fee) / float(position["cost_basis"]) - 1
         trades.append({
-            "strategy_id": spec.strategy_id, "ts_code": code,
+            "strategy_id": spec.strategy_id, "trade_id": position["trade_id"],
+            "ts_code": code,
             "name": names.get(code, ""), "entry_date": position["entry_date"],
             "exit_date": trade_date.date(), "holding_trading_days": int(position["holding_days"]),
             "holding_period": f"{position['entry_date']} 至 {trade_date.date()}",
@@ -189,12 +203,14 @@ def run_event_strategy(
             allocations = _entry_weights(candidates, spec)
             gross_budget = cash / (1 + buy_rate)
             for code, rank in candidates:
+                trade_sequence += 1
                 open_price = float(market.at[code, "open"])
                 gross = gross_budget * allocations[code]
                 fee = gross * buy_rate
                 shares = gross / open_price
                 cash -= gross + fee
                 positions[code] = {
+                    "trade_id": f"{spec.strategy_id}-{trade_sequence:06d}",
                     "shares": shares, "entry_date": trade_date.date(),
                     "entry_price": open_price, "cost_basis": gross + fee,
                     "holding_days": 1, "crossed20_date": None,
@@ -251,7 +267,8 @@ def run_event_strategy(
     for code, position in positions.items():
         price = float(position["last_price"])
         trades.append({
-            "strategy_id": spec.strategy_id, "ts_code": code, "name": names.get(code, ""),
+            "strategy_id": spec.strategy_id, "trade_id": position["trade_id"],
+            "ts_code": code, "name": names.get(code, ""),
             "entry_date": position["entry_date"], "exit_date": final_date.date(),
             "holding_period": f"{position['entry_date']} 至 {final_date.date()}",
             "holding_trading_days": int(position["holding_days"]),
@@ -263,14 +280,28 @@ def run_event_strategy(
         })
     trades_frame = pd.DataFrame(trades)
     events_frame = pd.DataFrame(events)
+    if not events_frame.empty and not trades_frame.empty:
+        outcomes = trades_frame[[
+            "trade_id", "exit_date", "exit_price", "price_change", "net_return",
+            "exit_reason", "status",
+        ]].rename(columns={
+            "exit_date": "final_exit_date", "exit_price": "final_exit_price",
+            "price_change": "final_price_change", "net_return": "final_net_return",
+            "exit_reason": "final_exit_reason", "status": "final_status",
+        })
+        events_frame = events_frame.merge(outcomes, on="trade_id", how="left")
     metrics = calculate_metrics(result)
     closed = trades_frame[trades_frame.get("status", pd.Series(dtype=str)).eq("已平仓")]
     metrics.update({
         "strategy_id": spec.strategy_id, "strategy_name": spec.name,
         "strategy_description": spec.description,
-        "profit_take_30_count": int(closed["exit_reason"].eq(take_profit_label).sum()) if not closed.empty else 0,
+        "take_profit_count": int(closed["exit_reason"].eq(take_profit_label).sum()) if not closed.empty else 0,
         "crossed_20_count": len(events_frame),
-        "completed_trades": len(closed), "open_positions": len(positions),
+        "completed_trades": len(closed), "total_trade_count": len(closed),
+        "profitable_trade_count": int(closed["net_return"].gt(0).sum()) if not closed.empty else 0,
+        "losing_trade_count": int(closed["net_return"].lt(0).sum()) if not closed.empty else 0,
+        "flat_trade_count": int(closed["net_return"].eq(0).sum()) if not closed.empty else 0,
+        "open_positions": len(positions),
         "average_holding_days": float(closed["holding_trading_days"].mean()) if not closed.empty else 0.0,
         "profitable_trade_rate": float(closed["net_return"].gt(0).mean()) if not closed.empty else 0.0,
         "take_profit_model": f"日内最高价触及{take_profit:.0%}时按目标价卖出；开盘跳空越过时按开盘价",
@@ -289,9 +320,10 @@ def write_strategy_result(
     }
     if events.empty and not len(events.columns):
         events = pd.DataFrame(columns=[
-            "strategy_id", "event", "ts_code", "name", "entry_date", "event_date",
+            "strategy_id", "trade_id", "event", "ts_code", "name", "entry_date", "event_date",
             "holding_period", "holding_trading_days", "entry_price", "trigger_price",
-            "day_high", "price_change",
+            "day_high", "price_change", "final_exit_date", "final_exit_price",
+            "final_price_change", "final_net_return", "final_exit_reason", "final_status",
         ])
     daily.to_csv(paths["daily"], index=False, encoding="utf-8-sig", float_format="%.8f")
     trades.to_csv(paths["trades"], index=False, encoding="utf-8-sig", float_format="%.8f")

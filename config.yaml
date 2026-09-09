@@ -62,5 +62,5 @@ strategy_suite:
   start_date: "2025-09-01"
   end_date: null
   output_dir: backtests/strategy_suite
-  take_profit: 0.30
+  take_profit: 0.20
   record_profit: 0.20

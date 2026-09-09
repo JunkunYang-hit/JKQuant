@@ -77,14 +77,17 @@ TRADE_NAMES = {
     "holding_period": "持股时间区间",
     "holding_trading_days": "持有交易日", "entry_price": "买入价",
     "exit_price": "结束价", "price_change": "价格变化", "net_return": "净收益",
-    "exit_reason": "结束原因", "crossed20_date": "首次超过20%日期", "status": "状态",
+    "exit_reason": "结束原因", "crossed20_date": "20%止盈日期", "status": "状态",
 }
 EVENT_NAMES = {
-    "strategy_id": "策略编号", "event": "事件", "ts_code": "股票代码",
+    "strategy_id": "策略编号", "trade_id": "交易编号", "event": "事件", "ts_code": "股票代码",
     "name": "证券简称", "entry_date": "买入日期", "event_date": "事件日期",
     "holding_period": "持股时间区间",
     "holding_trading_days": "已持有交易日", "entry_price": "买入价",
     "trigger_price": "触发价", "day_high": "当日最高价", "price_change": "最高涨幅",
+    "final_exit_date": "最终结束日期", "final_exit_price": "最终结束价",
+    "final_price_change": "最终价格变化", "final_net_return": "最终净收益",
+    "final_exit_reason": "最终退出原因", "final_status": "最终状态",
 }
 
 
@@ -346,9 +349,11 @@ def render_strategy_overview() -> None:
             "年化收益": metrics["annualized_return"], "超额收益": metrics["excess_return"],
             "夏普": metrics["sharpe_ratio"], "最大回撤": metrics["max_drawdown"],
             "年化波动": metrics["annualized_volatility"], "日胜率": metrics["win_rate"],
-            "已平仓交易": metrics.get("completed_trades", 0),
-            "盈利超20%记录": metrics.get("crossed_20_count", 0),
-            "30%止盈": metrics.get("profit_take_30_count", 0),
+            "总交易次数": metrics.get("total_trade_count"),
+            "盈利次数": metrics.get("profitable_trade_count"),
+            "亏损次数": metrics.get("losing_trade_count"),
+            "交易胜率": metrics.get("profitable_trade_rate"),
+            "20%止盈": metrics.get("take_profit_count", 0),
             "平均持有交易日": metrics.get("average_holding_days", 0),
         })
     comparison = pd.DataFrame(records).sort_values("累计收益", ascending=False)
@@ -358,16 +363,17 @@ def render_strategy_overview() -> None:
             "累计收益": "{:.2%}", "年化收益": "{:.2%}", "超额收益": "{:.2%}",
             "夏普": "{:.3f}", "最大回撤": "{:.2%}", "年化波动": "{:.2%}",
             "日胜率": "{:.2%}", "平均持有交易日": "{:.1f}",
-        }),
+            "交易胜率": "{:.2%}",
+        }, na_rep="—"),
         width="stretch", hide_index=True,
     )
     st.subheader("累计收益对比")
     st.bar_chart(comparison.set_index("策略")[["累计收益"]])
     selected = st.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
     threshold_note = (
-        "该新增策略记录20%盈利事件，并在达到30%时止盈。"
+        "该新增策略在盈利达到20%时记录完整事件并止盈。"
         if selected["metrics"].get("threshold_enabled", True)
-        else "该策略是原三日调仓基准，不应用20%/30%阈值规则。"
+        else "该策略是原三日调仓基准，不应用20%止盈规则。"
     )
     st.info(selected["description"] + " " + threshold_note)
     st.caption("进入“策略分析”页面可查看所选策略的净值、回撤、逐日数据、交易区间和阈值事件。")
@@ -388,9 +394,10 @@ def _render_glossary() -> None:
             "- **最大回撤**：越接近0越好。10%以内较低，10%～20%中等，30%以上通常属于高回撤。\n"
             "- **年化波动率**：越低越稳定；股票策略可粗略将15%以下视为较低、15%～30%中等、30%以上较高。\n"
             "- **日胜率**：正收益交易日占比；越高通常越好，但还必须结合每次盈亏幅度。\n"
-            "- **交易胜率**：已平仓交易中净收益为正的比例，与日胜率不是同一指标。\n"
-            "- **20%记录**：持仓期间最高价首次达到买入价上方20%的事件，只记录、不卖出。\n"
-            "- **30%止盈**：日内最高价达到目标时模拟卖出；日线无法还原分钟成交顺序，因此属于近似撮合。\n"
+            "- **20%止盈**：持仓期间最高价首次达到买入价上方20%时记录并模拟卖出；事件表同时记录该次交易最终结果。\n"
+            "- **总交易次数**：已经完成买入和卖出的完整交易数；期末仍持有的仓位不计入。\n"
+            "- **盈利/亏损次数**：按扣除买卖成本后的单笔净收益大于0或小于0统计，等于0单列为持平。\n"
+            "- **交易胜率**：盈利交易次数÷总已平仓交易次数；持有中的仓位不计入。\n"
             "- **换手率**：越低越节省成本，但过低也可能反应迟钝；需要结合超额收益判断。以上区间都是研究经验值，不是保证。"
         )
 
@@ -427,10 +434,15 @@ def render_backtest() -> None:
     columns[3].metric("交易/调仓次数", int(metrics.get("completed_trades", metrics.get("rebalance_count", 0))))
     if metrics.get("threshold_enabled", "crossed_20_count" in metrics):
         columns = st.columns(4)
-        columns[0].metric("盈利超20%记录", int(metrics.get("crossed_20_count", 0)))
-        columns[1].metric("30%止盈次数", int(metrics.get("profit_take_30_count", 0)))
-        columns[2].metric("平均持有交易日", f"{metrics.get('average_holding_days', 0):.1f}")
+        columns[0].metric("总交易次数", int(metrics.get("total_trade_count", 0)))
+        columns[1].metric("盈利次数", int(metrics.get("profitable_trade_count", 0)))
+        columns[2].metric("亏损次数", int(metrics.get("losing_trade_count", 0)))
         columns[3].metric("交易胜率", _percent(metrics.get("profitable_trade_rate", 0)))
+        columns = st.columns(4)
+        columns[0].metric("20%止盈次数", int(metrics.get("take_profit_count", 0)))
+        columns[1].metric("持平次数", int(metrics.get("flat_trade_count", 0)))
+        columns[2].metric("平均持有交易日", f"{metrics.get('average_holding_days', 0):.1f}")
+        columns[3].metric("期末持仓", int(metrics.get("open_positions", 0)))
 
     st.subheader("净值曲线")
     equity = daily.set_index("trade_date")[["equity", "benchmark_equity"]]
@@ -455,10 +467,13 @@ def render_backtest() -> None:
         st.subheader("盈利阈值事件")
         events = pd.read_csv(events_path).rename(columns=EVENT_NAMES)
         if events.empty:
-            st.info("该策略没有出现盈利超过20%的持仓事件。")
+            st.info("该策略没有出现触发20%止盈的持仓事件。")
         else:
             if "最高涨幅" in events:
                 events["最高涨幅"] = events["最高涨幅"].map(lambda value: f"{value:.2%}")
+            for column in ["最终价格变化", "最终净收益"]:
+                if column in events:
+                    events[column] = events[column].map(lambda value: f"{value:.2%}")
             st.dataframe(events, width="stretch", hide_index=True)
     st.divider()
     _render_glossary()
