@@ -1,4 +1,5 @@
 from datetime import date
+import json
 from pathlib import Path
 
 import pytest
@@ -6,7 +7,10 @@ import pandas as pd
 import yaml
 
 from jkquant.config import load_config
-from jkquant.pipeline import best_strategy_recommendations, run_daily, selection_for_date
+from jkquant.pipeline import (
+    best_strategy_recommendations, combined_signal_definitions, run_daily,
+    selection_for_date,
+)
 
 
 def test_demo_pipeline_creates_top_k_csv(tmp_path: Path) -> None:
@@ -81,3 +85,41 @@ def test_best_strategy_recommendations_aggregate_entry_signals(tmp_path: Path, m
     assert len(metadata["strategies"]) == 5
     assert result.iloc[0]["strategy_support_count"] == 5
     assert result.loc[result["ts_code"].eq("000003.SZ"), "strategy_support_count"].iloc[0] == 3
+
+
+def test_combined_signal_definitions_use_lab_five_and_suite_three(tmp_path: Path) -> None:
+    lab_dir = tmp_path / "lab" / "2025-09-01_2026-09-09"
+    suite_dir = tmp_path / "suite" / "2025-09-01_2026-09-09"
+    lab_dir.mkdir(parents=True)
+    suite_dir.mkdir(parents=True)
+    pd.DataFrame([
+        {
+            "experiment_id": f"experiment_{index}", "strategy_name": f"试验{index}",
+            "entry_rank": 20, "exit_rank": 20, "confirmation_days": 2,
+            "take_profit": 0.20 + index / 100, "cumulative_return": 1 - index / 10,
+        }
+        for index in range(6)
+    ]).to_csv(lab_dir / "results.csv", index=False)
+    suite_ids = [
+        "s05_top20_streak3_confirm2", "s04_top50_streak2_confirm2",
+        "s05_top20_streak3", "s04_top50_streak2", "s02_top5_exit20_confirm2",
+    ]
+    (suite_dir / "suite.json").write_text(json.dumps({
+        "strategies": [
+            {
+                "strategy_id": strategy_id, "name": strategy_id,
+                "metrics": {"cumulative_return": 0.5 - index / 10, "take_profit_threshold": 0.20},
+            }
+            for index, strategy_id in enumerate(suite_ids)
+        ]
+    }, ensure_ascii=False), encoding="utf-8")
+    config = {
+        "_config_dir": str(tmp_path),
+        "strategy_lab": {"output_dir": "lab"},
+        "strategy_suite": {"output_dir": "suite"},
+    }
+    definitions = combined_signal_definitions(config)
+    assert len(definitions) == 8
+    assert sum(item["source"] == "策略试验场前五" for item in definitions) == 5
+    assert sum(item["source"] == "原联合推荐前三" for item in definitions) == 3
+    assert all(item["strategy_id"] != "s04_top50_streak2" for item in definitions)

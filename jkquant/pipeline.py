@@ -296,6 +296,190 @@ def best_strategy_recommendations(
         "reason": "", "strategies": strategy_meta, "suite": suite_path.parent.name,
         "coverage": coverage, "calculation": calculation,
     }
+
+
+def combined_signal_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return five best lab variants plus the best three retained suite strategies."""
+    definitions: list[dict[str, Any]] = []
+    lab_root = resolve_path(
+        config, config.get("strategy_lab", {}).get("output_dir", "backtests/strategy_lab")
+    )
+    lab_paths = sorted(lab_root.glob("*/results.csv"), reverse=True)
+    if lab_paths:
+        lab = pd.read_csv(lab_paths[0]).sort_values("cumulative_return", ascending=False).head(5)
+        for _, row in lab.iterrows():
+            definitions.append({
+                "strategy_id": f"lab_{row['experiment_id']}", "source": "策略试验场前五",
+                "name": str(row["strategy_name"]), "entry_rank": int(row["entry_rank"]),
+                "consecutive_rank": int(row["entry_rank"]), "consecutive_days": 3,
+                "exit_rank": int(row["exit_rank"]),
+                "confirmation_days": int(row["confirmation_days"]),
+                "take_profit": float(row["take_profit"]),
+                "historical_return": float(row["cumulative_return"]),
+            })
+    suite_root = resolve_path(
+        config, config.get("strategy_suite", {}).get("output_dir", "backtests/strategy_suite")
+    )
+    suite_paths = sorted(suite_root.glob("*/suite.json"), reverse=True)
+    if suite_paths:
+        suite = json.loads(suite_paths[0].read_text(encoding="utf-8"))
+        spec_by_id = {spec.strategy_id: spec for spec in STRATEGIES}
+        ranked = sorted(
+            (item for item in suite.get("strategies", []) if item.get("strategy_id") in spec_by_id),
+            key=lambda item: float(item["metrics"]["cumulative_return"]), reverse=True,
+        )[:3]
+        for item in ranked:
+            spec = spec_by_id[item["strategy_id"]]
+            definitions.append({
+                "strategy_id": spec.strategy_id, "source": "原联合推荐前三",
+                "name": spec.name, "entry_rank": spec.entry_rank,
+                "consecutive_rank": spec.consecutive_rank,
+                "consecutive_days": spec.consecutive_days, "exit_rank": spec.exit_rank,
+                "confirmation_days": spec.exit_confirmation_days,
+                "take_profit": float(item["metrics"].get("take_profit_threshold") or 0.20),
+                "historical_return": float(item["metrics"]["cumulative_return"]),
+            })
+    return definitions
+
+
+def _ranking_context(
+    config: dict[str, Any], selected_date: date,
+) -> tuple[list[date], dict[date, dict[str, int]]]:
+    store = build_store(config)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    history = cache.history(
+        strategy_key(_top50_config(config)), RECOMMENDATION_HISTORY_START, selected_date,
+    )
+    dates = sorted(history["trade_date"].unique()) if not history.empty else []
+    by_date = {
+        trade_date: day.set_index("ts_code")["rank"].astype(int).to_dict()
+        for trade_date, day in history.groupby("trade_date")
+    }
+    return dates, by_date
+
+
+def _consecutive_inside(
+    dates: list[date], by_date: dict[date, dict[str, int]], code: str, threshold: int,
+) -> int:
+    count = 0
+    for trade_date in reversed(dates):
+        if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) <= threshold:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _consecutive_outside(
+    dates: list[date], by_date: dict[date, dict[str, int]], code: str, threshold: int,
+) -> int:
+    count = 0
+    for trade_date in reversed(dates):
+        if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) > threshold:
+            count += 1
+        else:
+            break
+    return count
+
+
+def combined_signal_recommendations(
+    config: dict[str, Any], selected_date: date,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Aggregate current entry candidates from the fixed eight-strategy signal set."""
+    definitions = combined_signal_definitions(config)
+    if len(definitions) != 8:
+        return pd.DataFrame(), {
+            "reason": f"需要5个试验场策略和3个原策略，当前只找到{len(definitions)}个。",
+            "strategies": definitions,
+        }
+    signal_config = {**config, "strategy": {**config["strategy"], "top_k": CACHE_TOP_K}}
+    top50, calculation = selection_for_date(signal_config, selected_date)
+    dates, by_date = _ranking_context(config, selected_date)
+    rows: list[dict[str, Any]] = []
+    for definition in definitions:
+        required_rank = definition["consecutive_rank"]
+        for _, stock in top50.loc[top50["rank"].le(definition["entry_rank"])].iterrows():
+            code = str(stock["ts_code"])
+            streak = (
+                1 if required_rank is None
+                else _consecutive_inside(dates, by_date, code, int(required_rank))
+            )
+            if streak < int(definition["consecutive_days"]):
+                continue
+            rows.append({
+                "ts_code": code, "name": str(stock.get("name", code)),
+                "rank": int(stock["rank"]), "total_score": float(stock["total_score"]),
+                "close": float(stock["close"]),
+                "consecutive_entry_days": streak, "strategy_id": definition["strategy_id"],
+                "strategy_name": definition["name"], "strategy_source": definition["source"],
+                "strategy_return": definition["historical_return"],
+            })
+    metadata = {"reason": "", "strategies": definitions, "calculation": calculation}
+    if not rows:
+        metadata["reason"] = "八策略在所选日期均没有满足新开仓条件的股票。"
+        return pd.DataFrame(), metadata
+    detail = pd.DataFrame(rows)
+    recommendations = detail.groupby(["ts_code", "name"], as_index=False).agg(
+        rank=("rank", "min"), total_score=("total_score", "max"), close=("close", "max"),
+        consecutive_entry_days=("consecutive_entry_days", "max"),
+        strategy_support_count=("strategy_id", "nunique"),
+        supporting_strategies=("strategy_name", lambda values: "；".join(dict.fromkeys(values))),
+        best_supporting_return=("strategy_return", "max"),
+    ).sort_values(
+        ["strategy_support_count", "rank", "total_score"], ascending=[False, True, False],
+        kind="stable",
+    ).reset_index(drop=True)
+    recommendations.insert(0, "joint_rank", recommendations.index + 1)
+    return recommendations, metadata
+
+
+def stock_signal_reminders(
+    config: dict[str, Any], selected_date: date, ts_code: str,
+    entry_price: float, price_stop_loss: float,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Evaluate eight strategy exits, profit targets and an auxiliary price stop."""
+    definitions = combined_signal_definitions(config)
+    dates, by_date = _ranking_context(config, selected_date)
+    current_rank = by_date.get(selected_date, {}).get(ts_code, CACHE_TOP_K + 1)
+    store = build_store(config)
+    daily = store.load_daily()
+    market = daily[
+        daily["trade_date"].dt.date.eq(selected_date) & daily["ts_code"].eq(ts_code)
+    ]
+    if market.empty:
+        raise ValueError(f"{selected_date} 没有 {ts_code} 的日线行情")
+    row = market.iloc[-1]
+    day_high, day_low, close = float(row["high"]), float(row["low"]), float(row["close"])
+    price_stop = entry_price * (1 - price_stop_loss)
+    price_stop_met = day_low <= price_stop
+    records = []
+    for definition in definitions:
+        required_rank = definition["consecutive_rank"]
+        entry_streak = (
+            1 if required_rank is None
+            else _consecutive_inside(dates, by_date, ts_code, int(required_rank))
+        )
+        entry_met = current_rank <= definition["entry_rank"] and entry_streak >= definition["consecutive_days"]
+        exit_streak = _consecutive_outside(dates, by_date, ts_code, definition["exit_rank"])
+        rank_exit_met = exit_streak >= definition["confirmation_days"]
+        profit_price = entry_price * (1 + definition["take_profit"])
+        profit_met = day_high >= profit_price
+        records.append({
+            "strategy_name": definition["name"], "source": definition["source"],
+            "historical_return": definition["historical_return"], "current_rank": current_rank,
+            "entry_condition": entry_met, "entry_streak": entry_streak,
+            "take_profit_rate": definition["take_profit"], "take_profit_price": profit_price,
+            "take_profit_met": profit_met, "exit_rank": definition["exit_rank"],
+            "required_exit_confirmations": definition["confirmation_days"],
+            "current_exit_streak": exit_streak, "rank_exit_met": rank_exit_met,
+            "signal": "止盈" if profit_met else "策略退出" if rank_exit_met else "价格止损预警" if price_stop_met else "买入条件满足" if entry_met else "继续观察",
+        })
+    return pd.DataFrame(records), {
+        "trade_date": selected_date, "ts_code": ts_code, "open": float(row["open"]),
+        "high": day_high, "low": day_low, "close": close, "entry_price": entry_price,
+        "price_change_from_entry": close / entry_price - 1, "price_stop_loss": price_stop_loss,
+        "price_stop": price_stop, "price_stop_met": price_stop_met,
+    }
 def warm_recommendation_cache(
     config: dict[str, Any], start_date: date = RECOMMENDATION_HISTORY_START,
     end_date: date | None = None,

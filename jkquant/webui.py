@@ -14,7 +14,8 @@ import streamlit as st
 from jkquant.config import load_config
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
-    best_strategy_recommendations, recommendation_history_stats, selection_for_date,
+    combined_signal_recommendations, recommendation_history_stats, selection_for_date,
+    stock_signal_reminders,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -223,49 +224,6 @@ def render_topk() -> None:
         f"结果来源：{source}｜候选耗时：{calculation['elapsed_seconds']:.3f} 秒｜"
         f"历史 Top-50 缓存：{history_coverage['cached_days']}/{history_coverage['expected_days']} 个交易日"
     )
-    st.subheader("最佳五策略联合推荐")
-    joint, joint_meta = best_strategy_recommendations(config, selected_date, top_n=5)
-    strategies = pd.DataFrame(joint_meta.get("strategies", [])).rename(columns={
-        "name": "入选策略", "cumulative_return": "历史累计收益",
-    })
-    if not strategies.empty:
-        with st.expander("查看本次采用的五个策略"):
-            st.dataframe(
-                strategies[["入选策略", "历史累计收益"]].style.format({"历史累计收益": "{:.2%}"}),
-                width="stretch", hide_index=True,
-            )
-        positive_count = int(strategies["历史累计收益"].gt(0).sum())
-        if positive_count < len(strategies):
-            st.warning(
-                f"这五个策略只是当前回测中的相对前五名，其中仅 {positive_count}/{len(strategies)} "
-                "在该回测区间取得正收益。联合候选应作为进一步研究清单，不能视为已验证的买入建议。"
-            )
-    st.caption(
-        f"回测批次：{joint_meta.get('suite', '无')}。使用 {selected_date} 收盘后可知信息生成，"
-        "对应下一交易日的候选信号；实际开盘仍需检查涨停、停牌及 ST 状态。"
-    )
-    if joint.empty:
-        st.info(joint_meta.get("reason", "所选日期没有联合候选。"))
-    else:
-        joint_display = joint.rename(columns={
-            "joint_rank": "联合排序", "ts_code": "股票代码", "name": "证券简称",
-            "rank": "当日总排名", "total_score": "综合得分",
-            "consecutive_top20": "连续Top20（天）", "consecutive_top50": "连续Top50（天）",
-            "strategy_support_count": "策略支持数", "supporting_strategies": "支持策略",
-            "best_supporting_return": "支持策略最佳历史收益",
-            "mean_supporting_return": "支持策略平均历史收益",
-        })
-        st.dataframe(
-            joint_display.style.format({
-                "综合得分": "{:.3f}", "支持策略最佳历史收益": "{:.2%}",
-                "支持策略平均历史收益": "{:.2%}",
-            }), width="stretch", hide_index=True, height=430,
-        )
-        st.caption(
-            "联合排序先看策略支持数，再看当日总排名和综合得分。原版与两日确认版可能共享同一入场规则，"
-            "因此策略支持数是规则支持程度，不是五个相互独立模型的投票，也不是上涨概率。"
-        )
-    st.divider()
     score_columns = [column for column in frame if column.endswith("_score")]
 
     display = frame.copy()
@@ -671,6 +629,126 @@ def render_strategy_lab() -> None:
     )
 
 
+def render_signal_alerts() -> None:
+    st.title("交易信号提醒")
+    st.caption("合并策略试验场前五名与原联合推荐前三名，共八套规则。页面只生成研究提醒，不会自动下单。")
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    dates = _selection_dates()
+    if not dates:
+        st.info("尚无本地历史行情。请先运行：python scripts/run_today.py")
+        return
+    requested_date = st.date_input(
+        "选择信号日期", value=date.today(), min_value=dates[0],
+        max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD",
+    )
+    available = [value for value in dates if value <= requested_date]
+    selected_date = available[-1] if available else dates[0]
+    if selected_date != requested_date:
+        st.info(f"{requested_date} 不是本地交易日，已使用最近交易日 {selected_date}。")
+    with st.spinner("正在计算八策略联合信号……"):
+        joint, metadata = combined_signal_recommendations(config, selected_date)
+    definitions = pd.DataFrame(metadata.get("strategies", []))
+    if not definitions.empty:
+        rules = definitions.rename(columns={
+            "source": "来源", "name": "策略", "entry_rank": "连续入选范围",
+            "consecutive_days": "入选确认次数", "exit_rank": "跌出范围",
+            "confirmation_days": "卖出确认次数", "take_profit": "止盈阈值",
+            "historical_return": "历史累计收益",
+        })
+        with st.expander("查看八套策略规则", expanded=False):
+            st.dataframe(
+                rules[["来源", "策略", "连续入选范围", "入选确认次数", "跌出范围", "卖出确认次数", "止盈阈值", "历史累计收益"]]
+                .style.format({"止盈阈值": "{:.0%}", "历史累计收益": "{:.2%}"}),
+                width="stretch", hide_index=True,
+            )
+    if joint.empty:
+        st.warning(metadata.get("reason", "所选日期没有联合推荐。"))
+        return
+    st.subheader("八策略联合推荐")
+    joint_display = joint.rename(columns={
+        "joint_rank": "联合排序", "ts_code": "股票代码", "name": "证券简称",
+        "rank": "当日总排名", "total_score": "综合得分", "close": "收盘价",
+        "consecutive_entry_days": "连续满足天数", "strategy_support_count": "策略支持数",
+        "supporting_strategies": "支持策略", "best_supporting_return": "支持策略最佳历史收益",
+    })
+    st.dataframe(
+        joint_display.style.format({
+            "综合得分": "{:.3f}", "收盘价": "{:.2f}", "支持策略最佳历史收益": "{:.2%}",
+        }), width="stretch", hide_index=True, height=430,
+    )
+    st.caption(
+        "联合排序依次考虑策略支持数、当日总排名和综合得分。多套策略共享相近的入场逻辑，"
+        "支持数不是独立模型投票，也不是上涨概率。"
+    )
+
+    choices = {
+        row["ts_code"]: f"{row['ts_code']}｜{row['name']}｜{int(row['strategy_support_count'])}个策略支持"
+        for _, row in joint.iterrows()
+    }
+    selected_code = st.selectbox(
+        "选择要检查的联合推荐标的", joint["ts_code"].tolist(),
+        format_func=lambda value: choices[value],
+    )
+    selected_stock = joint[joint["ts_code"].eq(selected_code)].iloc[0]
+    held = st.toggle("我已经持有该股票", value=False)
+    input_left, input_right = st.columns(2)
+    entry_price = float(input_left.number_input(
+        "实际买入价（元）" if held else "假设买入价（元）",
+        min_value=0.01, value=float(selected_stock["close"]), step=0.01,
+        help="已持有时请填写真实含义上的持仓成本；未持有时默认用当日收盘价估算未来止盈/止损线。",
+    ))
+    price_stop_loss = float(input_right.number_input(
+        "辅助价格止损幅度（%）", min_value=1.0, max_value=50.0, value=10.0, step=1.0,
+        help="这是额外价格预警，没有纳入上述八套策略的历史回测。",
+    )) / 100
+    reminders, market = stock_signal_reminders(
+        config, selected_date, selected_code, entry_price, price_stop_loss,
+    )
+    if not held:
+        reminders["signal"] = reminders["entry_condition"].map(
+            {True: "买入条件满足", False: "不满足买入条件"}
+        )
+    take_profit_count = int(reminders["take_profit_met"].sum())
+    rank_exit_count = int(reminders["rank_exit_met"].sum())
+    entry_count = int(reminders["entry_condition"].sum())
+    cards = st.columns(5)
+    cards[0].metric("当日收盘价", f"{market['close']:.2f} 元")
+    cards[1].metric("相对成本收益", _percent(market["price_change_from_entry"]))
+    cards[2].metric("满足买入策略", f"{entry_count}/8")
+    cards[3].metric("触发止盈策略", f"{take_profit_count}/8")
+    cards[4].metric("触发排名退出", f"{rank_exit_count}/8")
+    if held:
+        if take_profit_count:
+            st.error(f"止盈提醒：已有 {take_profit_count} 套策略的止盈线被当日最高价触及。")
+        if rank_exit_count:
+            st.error(f"退出提醒：已有 {rank_exit_count} 套策略满足排名退出及确认次数，下一交易日尝试卖出。")
+        if market["price_stop_met"]:
+            st.error(f"辅助价格止损提醒：当日最低价已触及 {market['price_stop']:.2f} 元。")
+        if not take_profit_count and not rank_exit_count and not market["price_stop_met"]:
+            st.success("当前未触发止盈、排名退出或辅助价格止损提醒。")
+    else:
+        st.info(f"当前有 {entry_count}/8 套策略满足新开仓条件；止盈和止损价格仅为按假设买入价计算的参考线。")
+
+    detail = reminders.rename(columns={
+        "strategy_name": "策略", "source": "来源", "historical_return": "历史累计收益",
+        "current_rank": "当前排名", "entry_condition": "满足买入", "entry_streak": "连续入选次数",
+        "take_profit_rate": "止盈比例", "take_profit_price": "止盈价",
+        "take_profit_met": "止盈已触发", "exit_rank": "跌出范围",
+        "required_exit_confirmations": "所需退出确认", "current_exit_streak": "当前连续跌出次数",
+        "rank_exit_met": "排名退出已触发", "signal": "当前信号",
+    })
+    st.subheader("逐策略信号明细")
+    st.dataframe(
+        detail.style.format({
+            "历史累计收益": "{:.2%}", "止盈比例": "{:.0%}", "止盈价": "{:.2f}",
+        }), width="stretch", hide_index=True, height=520,
+    )
+    st.caption(
+        "排名退出依据所选日期收盘后的 Top50 历史连续判断，实际卖出安排在下一交易日开盘；"
+        "若开盘跌停则按回测规则顺延。日内止盈/价格止损用当日最高价和最低价判断，仅适用于你在当日之前已经持仓的情况。"
+    )
+
+
 def render_system_help() -> None:
     st.title("系统说明")
     st.subheader("系统现在如何运行")
@@ -700,7 +778,7 @@ def render_system_help() -> None:
     st.subheader("仍需补齐的关键模块")
     st.markdown(
         "- 因子 IC、分层收益、相关性和稳定性诊断。\n"
-        "- 涨跌停、停牌延续、100股整数手和最低佣金等真实成交约束。\n"
+        "- 盘中开板排队、停牌延续、100股整数手和最低佣金等更精细的成交约束。\n"
         "- 历史 ST、退市、名称和指数成分的时点数据。\n"
         "- 完整复权价格和沪深300/中证500等真实指数基准。\n"
         "- 行业、市值暴露约束，以及自定义/指数股票池。\n"
@@ -712,13 +790,15 @@ def render_system_help() -> None:
 def main() -> None:
     st.set_page_config(page_title="JKQuant", page_icon="📈", layout="wide")
     st.sidebar.title("JKQuant")
-    page = st.sidebar.radio("页面", ["每日候选", "策略总览", "策略分析", "策略试验场", "系统说明"])
+    page = st.sidebar.radio("页面", ["每日候选", "交易信号提醒", "策略总览", "策略分析", "策略试验场", "系统说明"])
     st.sidebar.divider()
     st.sidebar.caption("本地只读展示界面，不执行自动交易。")
     if st.sidebar.button("刷新页面"):
         st.rerun()
     if page == "每日候选":
         render_topk()
+    elif page == "交易信号提醒":
+        render_signal_alerts()
     elif page == "策略总览":
         render_strategy_overview()
     elif page == "策略试验场":
