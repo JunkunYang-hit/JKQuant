@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from .backtest.engine import run_backtest as execute_backtest
 from .backtest.reporting import write_backtest_report
 from .backtest.strategy_suite import (
-    STRATEGIES, run_event_strategy, write_strategy_result, write_suite_index,
+    BASE_STRATEGIES, STRATEGIES, run_event_strategy, write_strategy_result,
+    write_suite_index,
 )
 from .config import resolve_path
 from .data.akshare_provider import AkshareMetadataProvider
@@ -285,6 +286,14 @@ def run_strategy_suite(
     root = resolve_path(
         config, settings.get("output_dir", "backtests/strategy_suite")
     ) / f"{start}_{end}"
+    root.mkdir(parents=True, exist_ok=True)
+    st_codes: set[str] = set()
+    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
+        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
+        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
+        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
+        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
+        LOGGER.info("策略回测按当前证券简称近似排除 ST：%d 只", len(st_codes))
     summaries: list[dict[str, Any]] = []
     baseline = execute_backtest(daily, basic, config, start, end)
     baseline.metrics.update({
@@ -297,6 +306,8 @@ def run_strategy_suite(
         "losing_trade_count": None, "flat_trade_count": None,
         "open_positions": int(baseline.daily["holdings"].iloc[-1]),
         "average_holding_days": 0.0, "profitable_trade_rate": None,
+        "st_filter_mode": "current_name_approximation",
+        "excluded_st_count": len(st_codes),
     })
     baseline_folder = root / "baseline_top10_3d"
     write_strategy_result(
@@ -317,6 +328,8 @@ def run_strategy_suite(
             take_profit=take_profit, record_profit=record_profit,
         )
         metrics["threshold_enabled"] = True
+        metrics["st_filter_mode"] = "current_name_approximation"
+        metrics["excluded_st_count"] = len(st_codes)
         folder = root / spec.strategy_id
         write_strategy_result(folder, result, trades, events, metrics)
         summaries.append({
@@ -325,6 +338,48 @@ def run_strategy_suite(
             "metrics": metrics,
         })
         LOGGER.info("策略回测完成: %s | 累计收益 %.2f%%", spec.name, metrics["cumulative_return"] * 100)
-    index_path = write_suite_index(root, start, end, summaries)
+    sweep_rows: list[dict[str, Any]] = []
+    raw_thresholds = settings.get("take_profit_sweep", [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, None])
+    thresholds = [None if value is None else float(value) for value in raw_thresholds]
+    for spec in BASE_STRATEGIES:
+        for threshold in thresholds:
+            _, sweep_trades, _, sweep_metrics = run_event_strategy(
+                daily, rankings, names, spec, start, end, initial_cash, costs,
+                take_profit=threshold, record_profit=threshold,
+            )
+            sweep_rows.append({
+                "strategy_id": spec.strategy_id,
+                "strategy_name": spec.name,
+                "take_profit_threshold": threshold,
+                "threshold_label": "不设止盈" if threshold is None else f"{threshold:.0%}",
+                "cumulative_return": sweep_metrics["cumulative_return"],
+                "annualized_return": sweep_metrics["annualized_return"],
+                "sharpe_ratio": sweep_metrics["sharpe_ratio"],
+                "max_drawdown": sweep_metrics["max_drawdown"],
+                "total_trade_count": sweep_metrics["total_trade_count"],
+                "profitable_trade_rate": sweep_metrics["profitable_trade_rate"],
+                "average_winner_return": sweep_metrics["average_winner_return"],
+                "average_loser_return": sweep_metrics["average_loser_return"],
+                "take_profit_count": sweep_metrics["take_profit_count"],
+                "open_positions": int(sweep_trades["status"].eq("持有中").sum()) if not sweep_trades.empty else 0,
+            })
+    sweep = pd.DataFrame(sweep_rows)
+    sweep_path = root / "take_profit_sweep.csv"
+    sweep.to_csv(sweep_path, index=False, encoding="utf-8-sig", float_format="%.8f")
+    threshold_summary = []
+    for label, group in sweep.groupby("threshold_label", sort=False):
+        threshold_summary.append({
+            "threshold": label,
+            "mean_cumulative_return": float(group["cumulative_return"].mean()),
+            "median_cumulative_return": float(group["cumulative_return"].median()),
+            "positive_strategy_count": int(group["cumulative_return"].gt(0).sum()),
+            "mean_max_drawdown": float(group["max_drawdown"].mean()),
+        })
+    index_path = write_suite_index(root, start, end, summaries, {
+        "st_filter": {"mode": "current_name_approximation", "excluded_count": len(st_codes)},
+        "trading_constraints": "开盘涨停不买、开盘跌停不卖",
+        "take_profit_sweep_file": sweep_path.name,
+        "take_profit_sweep_summary": threshold_summary,
+    })
     LOGGER.info("多策略回测汇总: %s", index_path)
     return index_path, summaries

@@ -10,6 +10,7 @@ import pandas as pd
 from ..factors import calculate_factors
 from ..strategy import select_stocks
 from .metrics import calculate_metrics
+from .trading_rules import is_open_limit_down, is_open_limit_up
 
 
 @dataclass
@@ -74,13 +75,38 @@ def run_backtest(
         close_return = market_today["close"] / market_today["pre_close"] - 1
         benchmark_return = float(close_return.replace([np.inf, -np.inf], np.nan).dropna().mean())
         turnover = buy = sell = cost_rate = 0.0
+        blocked_buys = blocked_sells = 0
         rebalanced = step % rebalance_days == 0
 
         if rebalanced:
             signal = factors[factors["trade_date"].eq(signal_date)]
             selection, _ = select_stocks(signal, basic, config, top_k=top_k)
             codes = [code for code in selection["ts_code"] if code in market_today.index]
-            target = _target_weights(codes, weighting) if codes else holdings.copy()
+            tradable_codes = []
+            for code in codes:
+                if code not in holdings and is_open_limit_up(
+                    code, float(market_today.at[code, "open"]),
+                    float(market_today.at[code, "pre_close"]),
+                ):
+                    blocked_buys += 1
+                    continue
+                tradable_codes.append(code)
+            raw_target = _target_weights(tradable_codes, weighting) if tradable_codes else holdings.copy()
+            locked = {
+                code: weight for code, weight in holdings.items()
+                if raw_target.get(code, 0.0) < weight and code in market_today.index
+                and is_open_limit_down(
+                    code, float(market_today.at[code, "open"]),
+                    float(market_today.at[code, "pre_close"]),
+                )
+            }
+            blocked_sells = len(locked)
+            remaining = max(0.0, 1.0 - sum(locked.values()))
+            adjustable = {code: weight for code, weight in raw_target.items() if code not in locked}
+            adjustable_total = sum(adjustable.values())
+            target = locked.copy()
+            if adjustable_total > 0:
+                target.update({code: weight / adjustable_total * remaining for code, weight in adjustable.items()})
             changes = {code: target.get(code, 0.0) - holdings.get(code, 0.0) for code in set(target) | set(holdings)}
             buy = sum(max(value, 0.0) for value in changes.values())
             sell = sum(max(-value, 0.0) for value in changes.values())
@@ -120,6 +146,8 @@ def run_backtest(
             "transaction_cost": cost_rate,
             "holdings": len(holdings),
             "rebalanced": rebalanced,
+            "limit_up_buy_blocked": blocked_buys,
+            "limit_down_sell_blocked": blocked_sells,
         })
 
     result = pd.DataFrame(records)
@@ -129,4 +157,9 @@ def run_backtest(
     result["equity_value"] = result["equity"] * float(settings["initial_cash"])
     result["benchmark_equity"] = (1 + result["benchmark_return"]).cumprod()
     result["drawdown"] = result["equity"] / result["equity"].cummax() - 1
-    return BacktestResult(result, pd.DataFrame(trades), calculate_metrics(result))
+    metrics = calculate_metrics(result)
+    metrics.update({
+        "limit_up_buy_blocked_count": int(result["limit_up_buy_blocked"].sum()),
+        "limit_down_sell_blocked_count": int(result["limit_down_sell_blocked"].sum()),
+    })
+    return BacktestResult(result, pd.DataFrame(trades), metrics)

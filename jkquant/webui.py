@@ -67,6 +67,8 @@ DAILY_NAMES = {
     "equity_value": "账户权益", "benchmark_equity": "基准净值",
     "drawdown": "回撤",
     "cash": "现金",
+    "limit_up_buy_blocked": "涨停未买入（只）",
+    "limit_down_sell_blocked": "跌停未卖出（只）",
 }
 TRADE_NAMES = {
     "trade_date": "交易日期", "signal_date": "信号日期", "holdings": "持仓数量",
@@ -78,6 +80,8 @@ TRADE_NAMES = {
     "holding_trading_days": "持有交易日", "entry_price": "买入价",
     "exit_price": "结束价", "price_change": "价格变化", "net_return": "净收益",
     "exit_reason": "结束原因", "crossed20_date": "20%止盈日期", "status": "状态",
+    "max_gain": "持有期最大盈利",
+    "max_drawdown_during_holding": "持有期最大不利波动",
 }
 EVENT_NAMES = {
     "strategy_id": "策略编号", "trade_id": "交易编号", "event": "事件", "ts_code": "股票代码",
@@ -341,6 +345,11 @@ def render_strategy_overview() -> None:
         f"统一比较区间：{suite['start_date']} 至 {suite['end_date']}｜"
         f"生成时间：{suite['generated_at']}"
     )
+    st.caption(
+        f"成交约束：{suite.get('trading_constraints', '未记录')}；"
+        f"ST 过滤：按当前简称近似排除 {suite.get('st_filter', {}).get('excluded_count', 0)} 只。"
+        "当前 120 积分数据无法还原每个历史交易日的 ST 状态。"
+    )
     records = []
     for strategy in suite["strategies"]:
         metrics = strategy["metrics"]
@@ -355,6 +364,8 @@ def render_strategy_overview() -> None:
             "交易胜率": metrics.get("profitable_trade_rate"),
             "20%止盈": metrics.get("take_profit_count", 0),
             "平均持有交易日": metrics.get("average_holding_days", 0),
+            "涨停未买入": metrics.get("limit_up_buy_blocked_count", 0),
+            "跌停未卖出": metrics.get("limit_down_sell_blocked_count", 0),
         })
     comparison = pd.DataFrame(records).sort_values("累计收益", ascending=False)
     st.subheader("横向比较")
@@ -369,6 +380,59 @@ def render_strategy_overview() -> None:
     )
     st.subheader("累计收益对比")
     st.bar_chart(comparison.set_index("策略")[["累计收益"]])
+    sweep_path = folder / suite.get("take_profit_sweep_file", "take_profit_sweep.csv")
+    if sweep_path.exists():
+        sweep = pd.read_csv(sweep_path)
+        st.subheader("止盈阈值对照（原始 11 套策略）")
+        st.caption("用于隔离止盈阈值影响；两日确认版本不参与该表，避免同时改变两个变量。‘不设止盈’是对照组。")
+        threshold_summary = pd.DataFrame(suite.get("take_profit_sweep_summary", [])).rename(columns={
+            "threshold": "止盈阈值", "mean_cumulative_return": "平均累计收益",
+            "median_cumulative_return": "累计收益中位数", "positive_strategy_count": "盈利策略数",
+            "mean_max_drawdown": "平均最大回撤",
+        })
+        if not threshold_summary.empty:
+            st.dataframe(
+                threshold_summary.style.format({
+                    "平均累计收益": "{:.2%}", "累计收益中位数": "{:.2%}", "平均最大回撤": "{:.2%}",
+                }), width="stretch", hide_index=True,
+            )
+        best = sweep.loc[sweep.groupby("strategy_id")["cumulative_return"].idxmax(), [
+            "strategy_name", "threshold_label", "cumulative_return", "max_drawdown", "profitable_trade_rate",
+        ]].rename(columns={
+            "strategy_name": "策略", "threshold_label": "样本内最佳止盈", "cumulative_return": "累计收益",
+            "max_drawdown": "最大回撤", "profitable_trade_rate": "交易胜率",
+        }).sort_values("累计收益", ascending=False)
+        st.dataframe(
+            best.style.format({"累计收益": "{:.2%}", "最大回撤": "{:.2%}", "交易胜率": "{:.2%}"}),
+            width="stretch", hide_index=True,
+        )
+        event_items = [item for item in suite["strategies"] if item["strategy_id"] != "baseline_top10_3d"]
+        item_map = {item["strategy_id"]: item for item in event_items}
+        base_items = [item for item in event_items if not item["strategy_id"].endswith("_confirm2")]
+        improved = sum(
+            item_map[f"{item['strategy_id']}_confirm2"]["metrics"]["cumulative_return"]
+            > item["metrics"]["cumulative_return"]
+            for item in base_items
+        )
+        best_threshold = max(
+            suite.get("take_profit_sweep_summary", []),
+            key=lambda item: item["median_cumulative_return"],
+        )
+        mean_win_rate = sum(item["metrics"]["profitable_trade_rate"] for item in base_items) / len(base_items)
+        mean_winner = sum(item["metrics"]["average_winner_return"] for item in base_items) / len(base_items)
+        mean_loser = abs(sum(item["metrics"]["average_loser_return"] for item in base_items) / len(base_items))
+        break_even = mean_loser / (mean_winner + mean_loser) if mean_winner + mean_loser else 0
+        st.subheader("本批次诊断")
+        st.markdown(
+            f"- **止盈不是设得太高**：跨策略累计收益中位数最好的阈值是 **{best_threshold['threshold']}**；"
+            "20% 更可能过早截断趋势，但单一历史区间不能证明未来最优。\n"
+            f"- **入场质量与反复换手是主要问题**：原始策略平均交易胜率约 **{mean_win_rate:.1%}**，"
+            f"按平均盈利/亏损幅度估算的盈亏平衡胜率约为 **{break_even:.1%}**。\n"
+            f"- **延迟一天退出有选择性价值**：11 个配对中有 **{improved} 个**改善、{11-improved} 个变差，"
+            "不能把两日确认统一视为更优。\n"
+            "- **成交量已经纳入**：当前流动性类别权重为 15%，包括 20 日平均成交额和 5/20 日成交额比；"
+            "它目前是流动性/活跃度评分，不是放量突破确认，后者应另做独立变量测试。"
+        )
     selected = st.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
     threshold_note = (
         "该新增策略在盈利达到20%时记录完整事件并止盈。"
@@ -443,6 +507,11 @@ def render_backtest() -> None:
         columns[1].metric("持平次数", int(metrics.get("flat_trade_count", 0)))
         columns[2].metric("平均持有交易日", f"{metrics.get('average_holding_days', 0):.1f}")
         columns[3].metric("期末持仓", int(metrics.get("open_positions", 0)))
+        columns = st.columns(4)
+        columns[0].metric("涨停未买入", int(metrics.get("limit_up_buy_blocked_count", 0)))
+        columns[1].metric("跌停未卖出", int(metrics.get("limit_down_sell_blocked_count", 0)))
+        columns[2].metric("平均盈利交易", _percent(metrics.get("average_winner_return", 0)))
+        columns[3].metric("平均亏损交易", _percent(metrics.get("average_loser_return", 0)))
 
     st.subheader("净值曲线")
     equity = daily.set_index("trade_date")[["equity", "benchmark_equity"]]
@@ -459,7 +528,7 @@ def render_backtest() -> None:
     if trades_path.exists():
         st.subheader("交易与持股区间")
         trades = pd.read_csv(trades_path).rename(columns=TRADE_NAMES)
-        for column in ["价格变化", "净收益"]:
+        for column in ["价格变化", "净收益", "持有期最大盈利", "持有期最大不利波动"]:
             if column in trades:
                 trades[column] = trades[column].map(lambda value: f"{value:.2%}")
         st.dataframe(trades, width="stretch", hide_index=True)
@@ -475,6 +544,10 @@ def render_backtest() -> None:
                 if column in events:
                     events[column] = events[column].map(lambda value: f"{value:.2%}")
             st.dataframe(events, width="stretch", hide_index=True)
+    st.caption(
+        "成交规则说明：信号在收盘后产生，次一交易日开盘执行；开盘封涨停时买单视为无法成交，"
+        "开盘封跌停时卖单顺延。持有期最大盈利越高表示曾出现更大浮盈；最大不利波动越负表示持仓期间承受的下跌越深。"
+    )
     st.divider()
     _render_glossary()
 

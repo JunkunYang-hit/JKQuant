@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from jkquant.backtest.strategy_suite import STRATEGIES, run_event_strategy
+from jkquant.backtest.strategy_suite import BASE_STRATEGIES, STRATEGIES, run_event_strategy
 
 
 def test_profit_threshold_is_recorded_and_sold() -> None:
@@ -62,7 +62,67 @@ def test_consecutive_strategy_waits_for_three_signals() -> None:
 
 def test_new_equal_weight_strategies_are_registered() -> None:
     specs = {spec.strategy_id: spec for spec in STRATEGIES}
-    assert len(specs) == 11
+    assert len(specs) == 22
     assert (specs["s09_top3_equal_exit10"].entry_rank, specs["s09_top3_equal_exit10"].exit_rank) == (3, 10)
     assert specs["s10_top5_equal_exit10"].weighting == "equal"
     assert (specs["s11_top5_streak2_exit10"].consecutive_rank, specs["s11_top5_streak2_exit10"].consecutive_days) == (5, 2)
+    assert len(BASE_STRATEGIES) == 11
+    assert all(spec.exit_confirmation_days == 2 for spec in STRATEGIES[11:])
+
+
+def test_limit_up_blocks_buy() -> None:
+    dates = pd.date_range("2025-09-01", periods=3, freq="B")
+    daily = pd.DataFrame({
+        "trade_date": dates, "ts_code": "000001.SZ",
+        "open": [10.0, 11.0, 10.0], "high": [10.0, 11.0, 10.1],
+        "low": [10.0, 11.0, 9.9], "close": [10.0, 11.0, 10.0],
+        "pre_close": [10.0, 10.0, 11.0],
+    })
+    rankings = pd.DataFrame({"trade_date": [value.date() for value in dates], "rank": 1, "ts_code": "000001.SZ"})
+    costs = {"commission_buy": 0, "commission_sell": 0, "stamp_tax": 0, "slippage": 0}
+    result, _, _, metrics = run_event_strategy(
+        daily, rankings, {}, BASE_STRATEGIES[0], dates[0].date(), dates[-1].date(), 1_000_000, costs,
+    )
+    assert result.iloc[1]["holdings"] == 0
+    assert metrics["limit_up_buy_blocked_count"] == 1
+
+
+def test_two_day_exit_confirmation_cancels_when_rank_recovers() -> None:
+    dates = pd.date_range("2025-09-01", periods=6, freq="B")
+    daily = pd.DataFrame({
+        "trade_date": dates, "ts_code": "000001.SZ", "open": 10.0, "high": 10.1,
+        "low": 9.9, "close": 10.0, "pre_close": 10.0,
+    })
+    rankings = pd.DataFrame({
+        "trade_date": [value.date() for value in dates], "rank": [1, 21, 1, 21, 21, 21],
+        "ts_code": "000001.SZ",
+    })
+    costs = {"commission_buy": 0, "commission_sell": 0, "stamp_tax": 0, "slippage": 0}
+    _, trades, _, _ = run_event_strategy(
+        daily, rankings, {}, STRATEGIES[11], dates[0].date(), dates[-1].date(), 1_000_000, costs,
+    )
+    closed = trades[trades["status"].eq("已平仓")]
+    assert len(closed) == 1
+    assert closed.iloc[0]["exit_date"] == dates[-1].date()
+
+
+def test_limit_down_delays_sell_until_next_tradable_open() -> None:
+    dates = pd.date_range("2025-09-01", periods=4, freq="B")
+    daily = pd.DataFrame({
+        "trade_date": dates, "ts_code": "000001.SZ",
+        "open": [10.0, 10.0, 9.0, 9.2], "high": [10.1, 10.1, 9.0, 9.3],
+        "low": [9.9, 9.9, 9.0, 9.1], "close": [10.0, 10.0, 9.0, 9.2],
+        "pre_close": [10.0, 10.0, 10.0, 9.0],
+    })
+    rankings = pd.DataFrame({
+        "trade_date": [value.date() for value in dates], "rank": [1, 21, 21, 21],
+        "ts_code": "000001.SZ",
+    })
+    costs = {"commission_buy": 0, "commission_sell": 0, "stamp_tax": 0, "slippage": 0}
+    _, trades, _, metrics = run_event_strategy(
+        daily, rankings, {}, BASE_STRATEGIES[0], dates[0].date(), dates[-1].date(),
+        1_000_000, costs, take_profit=None, record_profit=None,
+    )
+    closed = trades[trades["status"].eq("已平仓")]
+    assert metrics["limit_down_sell_blocked_count"] == 1
+    assert closed.iloc[0]["exit_date"] == dates[-1].date()

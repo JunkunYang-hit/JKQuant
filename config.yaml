@@ -64,3 +64,5 @@ strategy_suite:
   output_dir: backtests/strategy_suite
   take_profit: 0.20
   record_profit: 0.20
+  # 用原始 11 套策略横向测试止盈；null 表示不设固定止盈。
+  take_profit_sweep: [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, null]
