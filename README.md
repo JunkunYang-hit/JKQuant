@@ -29,12 +29,15 @@ python scripts/run_daily.py
 
 ## 使用 Tushare 实盘数据
 
-在 `config.yaml` 中把 `data.provider` 改为 `tushare`，然后仅在当前终端设置 Token（不要写进仓库）：
+在 `config.yaml` 中把 `data.provider` 改为 `tushare`，复制凭据模板并填写 Token：
 
 ```powershell
-$env:TUSHARE_TOKEN = "你的 token"
+Copy-Item .env.example .env
+# 用编辑器打开 .env，将占位内容替换为你的真实 Token
 python scripts/run_daily.py
 ```
+
+程序会自动读取项目根目录的 `.env`。该文件已被 `.gitignore` 排除，不会被 Git 提交。也仍然支持只在当前 PowerShell 会话中设置 `$env:TUSHARE_TOKEN = "你的 token"`。
 
 也可以仅更新数据：
 

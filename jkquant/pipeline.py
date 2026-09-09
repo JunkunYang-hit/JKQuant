@@ -5,6 +5,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 from .config import resolve_path
 from .data.demo_provider import DemoProvider
 from .data.storage import ParquetStore
@@ -22,7 +24,8 @@ def build_provider(config: dict[str, Any]):
     if data["provider"] == "demo":
         return DemoProvider(int(data["demo_stock_count"]), int(data["demo_seed"]))
     if data["provider"] == "tushare":
-        return TushareProvider()
+        load_dotenv(Path(config["_config_dir"]) / ".env")
+        return TushareProvider(token_env=data.get("token_env", "TUSHARE_TOKEN"))
     raise ValueError(f"不支持的数据源: {data['provider']}")
 
 

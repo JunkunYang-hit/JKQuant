@@ -8,6 +8,7 @@ from jkquant.pipeline import run_daily
 
 def test_demo_pipeline_creates_top_k_csv(tmp_path: Path) -> None:
     source = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+    source["data"]["provider"] = "demo"
     source["data"]["cache_dir"] = str(tmp_path / "cache")
     source["report"]["output_dir"] = str(tmp_path / "reports")
     source["strategy"]["top_k"] = 10
@@ -17,4 +18,3 @@ def test_demo_pipeline_creates_top_k_csv(tmp_path: Path) -> None:
     assert report.exists()
     assert len(report.read_text(encoding="utf-8-sig").splitlines()) == 11
     assert summary["universe_count"] == 100
-

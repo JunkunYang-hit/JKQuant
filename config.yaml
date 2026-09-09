@@ -1,6 +1,7 @@
 data:
   # demo 可直接运行；准备实盘时改为 tushare，并设置环境变量 TUSHARE_TOKEN。
-  provider: demo
+  provider: tushare
+  token_env: TUSHARE_TOKEN
   cache_dir: data/cache
   history_days: 220
   demo_stock_count: 100
@@ -31,4 +32,3 @@ strategy:
 
 report:
   output_dir: reports
-

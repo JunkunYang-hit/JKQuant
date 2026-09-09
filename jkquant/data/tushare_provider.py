@@ -9,10 +9,12 @@ from .provider import DataProvider
 
 
 class TushareProvider(DataProvider):
-    def __init__(self, token: str | None = None) -> None:
-        token = token or os.getenv("TUSHARE_TOKEN")
+    def __init__(self, token: str | None = None, token_env: str = "TUSHARE_TOKEN") -> None:
+        token = token or os.getenv(token_env)
         if not token:
-            raise RuntimeError("使用 Tushare 前请设置环境变量 TUSHARE_TOKEN")
+            raise RuntimeError(
+                f"未找到 Tushare Token，请在项目根目录的 .env 中设置 {token_env}=你的Token"
+            )
         try:
             import tushare as ts
         except ImportError as exc:
