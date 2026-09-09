@@ -5,7 +5,7 @@ import logging
 from datetime import date
 
 from .config import load_config
-from .pipeline import run_daily, run_update
+from .pipeline import run_daily, run_historical_backtest, run_update
 
 
 def _date(value: str) -> date:
@@ -17,15 +17,31 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     subparsers = parser.add_subparsers(dest="command", required=True)
     update = subparsers.add_parser("update", help="更新本地数据")
+    update.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     update.add_argument("--end", type=_date)
     daily = subparsers.add_parser("daily", help="更新数据并输出 Top-K")
+    daily.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     daily.add_argument("--end", type=_date)
+    backtest = subparsers.add_parser("backtest", help="执行历史 Top-K 回测")
+    backtest.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    backtest.add_argument("--start", type=_date)
+    backtest.add_argument("--end", type=_date)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     config = load_config(args.config)
     if args.command == "update":
         store = run_update(config, args.end)
         print(f"数据目录: {store.root}")
+        return
+    if args.command == "backtest":
+        paths, metrics = run_historical_backtest(config, args.start, args.end)
+        print(f"累计收益: {metrics['cumulative_return']:.2%}")
+        print(f"基准收益: {metrics['benchmark_return']:.2%}")
+        print(f"年化收益: {metrics['annualized_return']:.2%}")
+        print(f"Sharpe: {metrics['sharpe_ratio']:.3f}")
+        print(f"最大回撤: {metrics['max_drawdown']:.2%}")
+        print(f"回测指标: {paths['metrics']}")
+        print(f"净值图: {paths['plot']}")
         return
     path, summary = run_daily(config, args.end)
     print(f"数据日期: {summary['trade_date']}")
@@ -37,4 +53,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

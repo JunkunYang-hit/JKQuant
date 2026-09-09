@@ -7,7 +7,7 @@ __pycache__/
 .env
 data/cache/
 reports/
+backtests/
 *.egg-info/
 build/
 dist/
-

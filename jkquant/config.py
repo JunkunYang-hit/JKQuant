@@ -25,6 +25,15 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("strategy.category_weights 权重之和必须为 1")
     if int(config["strategy"]["top_k"]) <= 0:
         raise ValueError("strategy.top_k 必须大于 0")
+    if "backtest" in config:
+        backtest = config["backtest"]
+        if int(backtest["top_k"]) <= 0 or int(backtest["rebalance_days"]) <= 0:
+            raise ValueError("backtest.top_k 和 rebalance_days 必须大于 0")
+        if float(backtest["initial_cash"]) <= 0:
+            raise ValueError("backtest.initial_cash 必须大于 0")
+        costs = backtest["cost"]
+        if any(float(value) < 0 for value in costs.values()):
+            raise ValueError("回测交易成本不能为负数")
 
 
 def resolve_path(config: dict[str, Any], value: str) -> Path:
@@ -32,4 +41,3 @@ def resolve_path(config: dict[str, Any], value: str) -> Path:
     if path.is_absolute():
         return path
     return Path(config["_config_dir"]) / path
-

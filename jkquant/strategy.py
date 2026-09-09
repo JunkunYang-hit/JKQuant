@@ -6,7 +6,10 @@ import pandas as pd
 
 
 def select_stocks(
-    factors: pd.DataFrame, basic: pd.DataFrame, config: dict[str, Any]
+    factors: pd.DataFrame,
+    basic: pd.DataFrame,
+    config: dict[str, Any],
+    top_k: int | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int | str]]:
     """Filter and rank the latest available cross-section."""
     if factors.empty:
@@ -18,7 +21,9 @@ def select_stocks(
     market = config["market"]
     if market.get("exclude_st", True):
         latest = latest[~latest["name"].fillna("").str.upper().str.contains("ST")]
-    latest = latest[latest["list_status"].fillna("L").eq("L")]
+    if "delist_date" in latest:
+        delist_date = pd.to_datetime(latest["delist_date"], errors="coerce")
+        latest = latest[delist_date.isna() | delist_date.gt(selection_date)]
     list_days = (selection_date - pd.to_datetime(latest["list_date"])).dt.days
     latest = latest[list_days.ge(int(market["min_list_days"]))]
     latest = latest[latest["amount"].gt(float(market["min_amount"]))]
@@ -41,7 +46,8 @@ def select_stocks(
         latest[f"{category}_score"] = sum(latest[col] * weight for col, weight in columns) / weight_sum
     weights = config["strategy"]["category_weights"]
     latest["total_score"] = sum(latest[f"{name}_score"] * weight for name, weight in weights.items())
-    latest = latest.sort_values("total_score", ascending=False).head(int(config["strategy"]["top_k"]))
+    limit = int(top_k or config["strategy"]["top_k"])
+    latest = latest.sort_values("total_score", ascending=False).head(limit)
     latest.insert(0, "rank", range(1, len(latest) + 1))
     columns = ["rank", "trade_date", "ts_code", "name", "total_score"]
     columns += [f"{name}_score" for name in weights]

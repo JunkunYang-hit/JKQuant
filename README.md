@@ -10,6 +10,45 @@
 - ST、退市/暂停上市、上市天数、成交额、零成交过滤
 - 因子方向统一、类内加权、类别固定权重、Top-K CSV
 - 避免未来函数的滚动计算测试；配置权重自动校验
+- Top-K 等权、定期调仓回测，含买卖佣金、印花税和滑点
+- 回测指标、逐日净值、调仓明细以及净值/回撤图
+
+## 项目结构与职责
+
+```text
+JKQuant/
+├── config.yaml                 # 唯一的运行参数入口：数据、过滤、因子、回测、成本
+├── environment.yml            # Conda 环境定义
+├── pyproject.toml              # Python 包、依赖和 jkquant 命令定义
+├── .env                        # 本机 Tushare Token；被 Git 忽略，不会提交
+├── jkquant/                    # 核心 Python 包
+│   ├── cli.py                  # update / daily / backtest 命令解析及终端输出
+│   ├── config.py               # YAML 加载、路径解析、权重和参数校验
+│   ├── pipeline.py             # 编排数据更新、每日选股和历史回测
+│   ├── factors.py              # 8 个量价因子的滚动计算，只使用当日及历史数据
+│   ├── strategy.py             # 股票过滤、横截面排名、分类得分和 Top-K
+│   ├── report.py               # 每日选股 CSV 输出
+│   ├── data/
+│   │   ├── provider.py         # 所有数据源必须实现的统一接口
+│   │   ├── tushare_provider.py # Tushare 调用、限速、重试、字段标准化
+│   │   ├── demo_provider.py    # 可重复的模拟数据，只用于测试系统能否运行
+│   │   ├── storage.py          # Parquet 读取、去重、合并和落盘
+│   │   └── updater.py          # 增量/回填下载、按月保存、基础信息刷新策略
+│   └── backtest/
+│       ├── engine.py           # 信号滞后、持仓、调仓、收益和交易成本计算
+│       ├── metrics.py          # 收益、Sharpe、回撤、波动率、胜率等指标
+│       └── reporting.py        # 回测 CSV、JSON 和净值/回撤图
+├── scripts/
+│   ├── update_data.py          # 只更新本地行情缓存
+│   ├── run_daily.py            # 更新数据并生成当天 Top-K
+│   └── run_backtest.py         # 更新所需历史数据并执行回测
+├── tests/                      # 因子无未来数据、完整流程和回测测试
+├── data/cache/<provider>/      # 本地数据缓存；demo/tushare 隔离且不提交
+├── reports/                    # 每日选股结果；不提交
+└── backtests/                  # 回测结果；不提交
+```
+
+日常运行的调用关系是 `scripts → cli → pipeline → data/factors/strategy → report`。回测复用完全相同的因子和选股逻辑，不另外维护一套“回测专用策略”，避免实盘选股与历史验证逻辑不一致。
 
 ## 安装（Conda）
 
@@ -19,7 +58,7 @@ conda activate jkquant
 pip install -e .
 ```
 
-首次可直接用默认 `demo` 数据验证完整流程：
+如需用 `demo` 数据验证安装，先临时把 `config.yaml` 的 `data.provider` 改为 `demo`，再运行：
 
 ```powershell
 python scripts/run_daily.py
@@ -29,11 +68,10 @@ python scripts/run_daily.py
 
 ## 使用 Tushare 实盘数据
 
-在 `config.yaml` 中把 `data.provider` 改为 `tushare`，复制凭据模板并填写 Token：
+在 `config.yaml` 中把 `data.provider` 改为 `tushare`，然后在项目根目录的 `.env` 填写 Token：
 
 ```powershell
-Copy-Item .env.example .env
-# 用编辑器打开 .env，将占位内容替换为你的真实 Token
+# .env 文件内容：TUSHARE_TOKEN=你的真实Token
 python scripts/run_daily.py
 ```
 
@@ -47,6 +85,23 @@ python scripts/update_data.py
 
 每次运行会从缓存最后日期的下一天开始更新。首次下载约两倍 `history_days` 的自然日，以保证滚动窗口有足够交易日。Tushare 接口权限和积分不足时会原样报告接口错误。
 
+### Tushare 频率与断点续传
+
+Tushare 的限制取决于账户积分，并非所有用户都是同一频率。官方当前权限表列出：120 积分为每分钟 50 次且只能访问未复权日线，2000 积分为每分钟 200 次，5000 积分以上为每分钟 500 次。`daily` 单次最多返回 6000 行，官方说明可按交易日循环提取历史数据。参见 [积分与频次权限表](https://tushare.pro/document/2?doc_id=290) 和 [A 股日线接口](https://tushare.pro/document/1?doc_id=27)。
+
+项目默认设置为每分钟 45 次，为 50 次档预留余量：
+
+```yaml
+data:
+  requests_per_minute: 45
+  max_retries: 5
+  retry_backoff_seconds: 5
+  request_timeout_seconds: 15
+  basic_refresh_days: 7
+```
+
+如果官网权限中心显示你的额度更高，可自行改为略低于实际上限的值，例如 190 或 480。下载器会在每次 API 调用前限速，临时错误使用指数退避重试；历史日线每约一个月写入一次 Parquet，所以中断后重新运行会从缓存边界继续。为了兼容只有 `daily` 权限的低积分账户，代码不依赖 `trade_cal`，节假日请求会得到空结果。
+
 ## 配置与因子
 
 所有策略参数都集中在 `config.yaml`。类别权重必须合计为 1；因子 `direction: 1` 表示越大越好，`-1` 表示越小越好。当前因子为 5/20 日收益、收盘价相对 MA20、MA5 相对 MA20、20 日波动率、20 日当前回撤、20 日平均成交额、5/20 日成交额比。
@@ -59,6 +114,29 @@ python scripts/update_data.py
 pytest -q
 ```
 
+## 历史回测
+
+默认参数位于 `config.yaml` 的 `backtest` 节点。可以直接使用配置日期：
+
+```powershell
+python scripts/run_backtest.py
+```
+
+也可以覆盖日期：
+
+```powershell
+python scripts/run_backtest.py --start 2025-01-01 --end 2025-12-31
+```
+
+输出目录为 `backtests/开始日期_结束日期/`：
+
+- `daily.csv`：逐日毛收益、净收益、成本、换手率、净值和回撤
+- `rebalances.csv`：每次调仓的信号日、交易日、买卖换手和持仓代码
+- `metrics.json`：年化/累计/基准/超额收益、Sharpe、最大回撤、年化波动、胜率及年度收益
+- `equity_drawdown.png`：策略与全市场等权基准净值、策略回撤
+
+信号在 T 日收盘后形成，最早于 T+1 开盘交易。调仓日将旧持仓隔夜收益和新持仓开盘至收盘收益分开计算，避免用 T+1 的价格选择 T 日股票。非调仓日使用收盘到收盘收益。当前基准是当日可交易股票的等权收益。
+
 ## 当前边界
 
-这是需求中的 Phase 1。尚未包含基本面/估值、财报公告日 point-in-time 对齐、历史成分股、回测、HTML/Excel 报告以及涨跌停成交撮合。它适合先稳定产出候选股，不构成投资建议。后续应优先增加带交易成本的历史回测，再扩展 daily_basic 和按公告日对齐的财务因子。
+当前已完成量价选股 MVP 和规则型历史回测。尚未包含基本面/估值、财报公告日 point-in-time 对齐、复权因子、严格的历史指数成分股、HTML/Excel 日报以及涨跌停成交撮合。当前 Tushare `daily` 是未复权行情，分红送转可能造成收益跳变；在补充 `adj_factor` 前，长期回测结果只能用于检查策略方向和工程流程，不能作为最终投资依据。股票名称使用当前基础信息，因此历史 ST 名称变化也尚未 point-in-time 化。本系统不构成投资建议。

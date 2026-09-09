@@ -4,6 +4,11 @@ data:
   token_env: TUSHARE_TOKEN
   cache_dir: data/cache
   history_days: 220
+  requests_per_minute: 45  # 120 积分档官方上限 50，保留安全余量
+  max_retries: 5
+  retry_backoff_seconds: 5
+  request_timeout_seconds: 15
+  basic_refresh_days: 7
   demo_stock_count: 100
   demo_seed: 20260909
 
@@ -32,3 +37,17 @@ strategy:
 
 report:
   output_dir: reports
+
+backtest:
+  start_date: "2025-01-01"
+  end_date: null  # null 表示截至本地最新交易日
+  top_k: 20
+  rebalance_days: 5
+  initial_cash: 1000000
+  benchmark: universe_equal_weight
+  output_dir: backtests
+  cost:
+    commission_buy: 0.0003
+    commission_sell: 0.0003
+    stamp_tax: 0.0005
+    slippage: 0.0005
