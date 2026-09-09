@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import math
 import os
 from pathlib import Path
@@ -10,7 +11,10 @@ import pandas as pd
 import streamlit as st
 
 from jkquant.config import load_config
-from jkquant.pipeline import available_selection_dates, selection_for_date
+from jkquant.data.akshare_provider import AkshareMetadataProvider
+from jkquant.pipeline import (
+    available_selection_dates, consecutive_top20_counts, selection_for_date,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_ROOT = PROJECT_ROOT / "reports"
@@ -77,6 +81,54 @@ def _selection_dates() -> list:
     return available_selection_dates(load_config(PROJECT_ROOT / "config.yaml"))
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _intraday(ts_code: str, selected_date) -> pd.DataFrame:
+    return AkshareMetadataProvider().intraday(ts_code, selected_date)
+
+
+def _recommendation_table(page: pd.DataFrame, streaks: dict[str, int]) -> str:
+    columns = [
+        "rank", "ts_code", "name", "total_score", "momentum_score",
+        "trend_score", "risk_score", "liquidity_score", "close", "amount",
+    ]
+    headers = "".join(f"<th>{html.escape(TOPK_NAMES[column])}</th>" for column in columns)
+    rows = []
+    for _, row in page.iterrows():
+        code = str(row["ts_code"])
+        streak = int(streaks.get(code, 0))
+        name = html.escape(str(row.get("name", code)))
+        if streak >= 2:
+            name_html = (
+                f'<span class="streak-name" title="连续 {streak} 个交易日进入 Top-20">'
+                f"{name}</span>"
+            )
+        else:
+            name_html = name
+        values = {
+            "rank": str(int(row["rank"])), "ts_code": html.escape(code), "name": name_html,
+            "total_score": f"{row['total_score']:.3f}",
+            "momentum_score": f"{row['momentum_score']:.3f}",
+            "trend_score": f"{row['trend_score']:.3f}",
+            "risk_score": f"{row['risk_score']:.3f}",
+            "liquidity_score": f"{row['liquidity_score']:.3f}",
+            "close": f"{row['close']:.2f}", "amount": f"{row['amount']:,.2f}",
+        }
+        rows.append("<tr>" + "".join(f"<td>{values[column]}</td>" for column in columns) + "</tr>")
+    return f"""
+    <style>
+      .topk-wrap {{overflow-x:auto; margin-bottom:0.75rem}}
+      .topk-table {{border-collapse:collapse; width:100%; min-width:1050px; font-size:14px}}
+      .topk-table th,.topk-table td {{border-bottom:1px solid #e5e7eb; padding:9px 10px; text-align:right; white-space:nowrap}}
+      .topk-table th {{background:#f6f8fa; color:#374151}}
+      .topk-table th:nth-child(2),.topk-table th:nth-child(3),
+      .topk-table td:nth-child(2),.topk-table td:nth-child(3) {{text-align:left}}
+      .streak-name {{color:#e02020; font-weight:700; cursor:help}}
+    </style>
+    <div class="topk-wrap"><table class="topk-table"><thead><tr>{headers}</tr></thead>
+    <tbody>{''.join(rows)}</tbody></table></div>
+    """
+
+
 def render_topk() -> None:
     st.title("每日候选（Top-K）")
     st.caption("120 积分模式：使用 Tushare 日线量价选股，当前证券简称由 AKShare 补充。")
@@ -98,12 +150,25 @@ def render_topk() -> None:
         st.info("尚无本地历史行情。请先运行：python scripts/update_data.py")
         return
     selected_date = st.selectbox("选择推荐日期", list(reversed(dates)), format_func=str)
-    with st.spinner("读取缓存或计算当日候选..."):
+    calculation_status = st.status("正在准备选股计算…", expanded=True)
+    progress = st.progress(10, text="读取日线数据和候选缓存")
+    try:
         frame, calculation = selection_for_date(
             config, selected_date
         )
+        progress.progress(60, text="统计连续进入 Top-20 的交易日数")
+        streaks, streak_cached = consecutive_top20_counts(config, selected_date)
+        progress.progress(100, text="候选、连续上榜统计和页面数据已准备完成")
+        calculation_status.update(label="选股计算完成", state="complete", expanded=False)
+    except Exception:
+        calculation_status.update(label="选股计算失败", state="error", expanded=True)
+        raise
     source = "SQLite 缓存" if calculation["cached"] else "首次计算并写入 SQLite"
-    st.caption(f"结果来源：{source}｜耗时：{calculation['elapsed_seconds']:.3f} 秒")
+    streak_source = "缓存" if streak_cached else "首次计算"
+    st.caption(
+        f"结果来源：{source}｜候选耗时：{calculation['elapsed_seconds']:.3f} 秒｜"
+        f"连续上榜：{streak_source}"
+    )
     score_columns = [column for column in frame if column.endswith("_score")]
     first, second, third, fourth = st.columns(4)
     first.metric("候选数量", len(frame))
@@ -128,16 +193,45 @@ def render_topk() -> None:
     page_start = (page_number - 1) * page_size
     page = display.iloc[page_start:page_start + page_size]
     st.caption(f"第 {page_number}/{page_count} 页｜第 {page_start + 1}–{page_start + len(page)} 名")
-    st.dataframe(
-        page.rename(columns=TOPK_NAMES), width="stretch", hide_index=True,
-        height=min(420, 38 + 35 * len(page)),
-    )
+    st.markdown(_recommendation_table(page, streaks), unsafe_allow_html=True)
+    st.caption("红色证券简称表示已连续至少 2 个交易日进入 Top-20；鼠标悬停在名称上可查看连续次数。")
     choices = dict(zip(display["ts_code"], display["name"], strict=False))
     code = st.selectbox(
         "查看单只股票的因子得分", display["ts_code"].tolist(),
         format_func=lambda value: f"{value}｜{choices.get(value, value)}",
     )
     row = frame.loc[frame["ts_code"].astype(str).eq(code)].iloc[0]
+    st.subheader("日内分时图")
+    if selected_date not in set(dates[-5:]):
+        st.info("免费 1 分钟数据仅覆盖最近 5 个交易日，请选择较近日期查看。")
+    elif st.button("加载该股票的 1 分钟分时图", type="secondary"):
+        try:
+            with st.spinner("正在从 AKShare 获取分钟行情…"):
+                minute = _intraday(code, selected_date)
+            if minute.empty:
+                st.warning("该日期没有取得分钟行情，可能是数据源尚未更新或接口临时不可用。")
+            else:
+                price_columns = ["close"] + (["average"] if "average" in minute and minute["average"].notna().any() else [])
+                price = minute[["datetime", *price_columns]].rename(
+                    columns={"close": "价格", "average": "均价"}
+                ).melt("datetime", var_name="曲线", value_name="价格（元）")
+                price_chart = alt.Chart(price).mark_line().encode(
+                    x=alt.X("datetime:T", title="时间", axis=alt.Axis(format="%H:%M")),
+                    y=alt.Y("价格（元）:Q", scale=alt.Scale(zero=False)),
+                    color=alt.Color("曲线:N", scale=alt.Scale(
+                        domain=["价格", "均价"], range=["#d62728", "#f2a900"]
+                    )),
+                    tooltip=[alt.Tooltip("datetime:T", title="时间", format="%H:%M"), "曲线:N", alt.Tooltip("价格（元）:Q", format=".2f")],
+                ).properties(height=300)
+                volume_chart = alt.Chart(minute).mark_bar(color="#6b93c6").encode(
+                    x=alt.X("datetime:T", title="时间", axis=alt.Axis(format="%H:%M")),
+                    y=alt.Y("volume:Q", title="成交量（手）"),
+                    tooltip=[alt.Tooltip("datetime:T", title="时间", format="%H:%M"), alt.Tooltip("volume:Q", title="成交量（手）", format=",")],
+                ).properties(height=120)
+                st.altair_chart(alt.vconcat(price_chart, volume_chart).resolve_scale(x="shared"), width="stretch")
+                st.caption("数据源：AKShare/东方财富。1 分钟数据不复权，仅提供近期交易日；点击按钮时按需获取。")
+        except Exception as exc:
+            st.warning(f"分钟行情暂时获取失败，不影响日线选股结果：{exc}")
     chart = pd.DataFrame(
         {
             "指标": [SCORE_NAMES.get(column, column) for column in score_columns],
@@ -293,7 +387,6 @@ def main() -> None:
     page = st.sidebar.radio("页面", ["每日候选", "回测指标", "系统说明"])
     st.sidebar.divider()
     st.sidebar.caption("本地只读展示界面，不执行自动交易。")
-    st.sidebar.warning("AKShare 可补充当前证券简称，但 120 积分仍不含可靠的历史 ST 状态、行业和完整复权因子。")
     if st.sidebar.button("刷新页面"):
         st.rerun()
     if page == "每日候选":

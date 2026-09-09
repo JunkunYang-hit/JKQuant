@@ -121,6 +121,49 @@ def selection_for_date(
     return selection, summary
 
 
+def consecutive_top20_counts(
+    config: dict[str, Any], selected_date: date
+) -> tuple[dict[str, int], bool]:
+    """Count consecutive trading-day Top-20 appearances ending on selected_date."""
+    store = build_store(config)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    top20_config = {**config, "strategy": {**config["strategy"], "top_k": 20}}
+    key = strategy_key(top20_config)
+    cached = cache.get_streaks(key, selected_date)
+    if cached is not None:
+        return cached, True
+
+    daily = store.load_daily()
+    target = pd.Timestamp(selected_date)
+    history = daily[daily["trade_date"].le(target)]
+    factors = calculate_factors(history)
+    dates = sorted(
+        (pd.Timestamp(value) for value in factors["trade_date"].unique()), reverse=True
+    )
+    latest_date = daily["trade_date"].max().date()
+    basic = store.load_basic()
+    streaks: dict[str, int] = {}
+    active: set[str] | None = None
+    for trade_date in dates:
+        day_factors = factors[factors["trade_date"].eq(trade_date)]
+        selection, _ = select_stocks(
+            day_factors, basic, top20_config, top_k=20,
+            use_current_metadata=trade_date.date() == latest_date,
+        )
+        members = set(selection["ts_code"].astype(str))
+        if active is None:
+            active = members
+            streaks = {code: 1 for code in active}
+            continue
+        active &= members
+        if not active:
+            break
+        for code in active:
+            streaks[code] += 1
+    cache.put_streaks(key, selected_date, streaks)
+    return streaks, False
+
+
 def run_historical_backtest(
     config: dict[str, Any], start_date: date | None = None, end_date: date | None = None
 ) -> tuple[dict[str, Path], dict[str, Any]]:

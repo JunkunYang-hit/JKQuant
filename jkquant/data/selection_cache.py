@@ -37,6 +37,16 @@ class SelectionCache:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_selection_date ON selection_results(trade_date)"
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS top20_streaks (
+                    strategy_key TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    ts_code TEXT NOT NULL,
+                    streak_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (strategy_key, trade_date, ts_code)
+                )"""
+            )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=10)
@@ -70,5 +80,33 @@ class SelectionCache:
                         json.dumps(record, ensure_ascii=False), created_at,
                     )
                     for record in records
+                ],
+            )
+
+    def get_streaks(self, key: str, trade_date: date) -> dict[str, int] | None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT ts_code, streak_count FROM top20_streaks
+                   WHERE strategy_key = ? AND trade_date = ?""",
+                (key, trade_date.isoformat()),
+            ).fetchall()
+        if not rows:
+            return None
+        return {str(code): int(count) for code, count in rows}
+
+    def put_streaks(self, key: str, trade_date: date, streaks: dict[str, int]) -> None:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM top20_streaks WHERE strategy_key = ? AND trade_date = ?",
+                (key, trade_date.isoformat()),
+            )
+            connection.executemany(
+                """INSERT INTO top20_streaks
+                   (strategy_key, trade_date, ts_code, streak_count, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (key, trade_date.isoformat(), code, int(count), created_at)
+                    for code, count in streaks.items()
                 ],
             )
