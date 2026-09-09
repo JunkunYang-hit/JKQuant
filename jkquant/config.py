@@ -33,6 +33,8 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError("backtest.top_k 必须在 1 到 50 之间")
         if int(backtest["rebalance_days"]) <= 0:
             raise ValueError("backtest.rebalance_days 必须大于 0")
+        if backtest.get("weighting", "equal") not in {"equal", "rank_linear"}:
+            raise ValueError("backtest.weighting 仅支持 equal 或 rank_linear")
         if float(backtest["initial_cash"]) <= 0:
             raise ValueError("backtest.initial_cash 必须大于 0")
         costs = backtest["cost"]

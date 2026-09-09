@@ -23,6 +23,18 @@ def _weighted_return(weights: dict[str, float], returns: pd.Series) -> float:
     return float(sum(weight * float(returns.get(code, 0.0)) for code, weight in weights.items()))
 
 
+def _target_weights(codes: list[str], method: str) -> dict[str, float]:
+    if not codes:
+        return {}
+    if method == "equal":
+        return {code: 1.0 / len(codes) for code in codes}
+    if method == "rank_linear":
+        raw = list(range(len(codes), 0, -1))
+        total = float(sum(raw))
+        return {code: weight / total for code, weight in zip(codes, raw, strict=True)}
+    raise ValueError(f"不支持的回测权重方法: {method}")
+
+
 def run_backtest(
     daily: pd.DataFrame,
     basic: pd.DataFrame,
@@ -30,7 +42,7 @@ def run_backtest(
     start_date: date,
     end_date: date,
 ) -> BacktestResult:
-    """Run a lagged-signal, equal-weight, long-only Top-K backtest.
+    """Run a lagged-signal, configurable-weight, long-only Top-K backtest.
 
     A signal formed after day T's close is first traded at T+1's open. On a
     rebalance day, old holdings earn the overnight leg and new holdings earn
@@ -45,6 +57,7 @@ def run_backtest(
     settings = config["backtest"]
     top_k = int(settings["top_k"])
     rebalance_days = int(settings["rebalance_days"])
+    weighting = str(settings.get("weighting", "equal"))
     costs = settings["cost"]
     holdings: dict[str, float] = {}
     records: list[dict[str, Any]] = []
@@ -67,7 +80,7 @@ def run_backtest(
             signal = factors[factors["trade_date"].eq(signal_date)]
             selection, _ = select_stocks(signal, basic, config, top_k=top_k)
             codes = [code for code in selection["ts_code"] if code in market_today.index]
-            target = {code: 1.0 / len(codes) for code in codes} if codes else holdings.copy()
+            target = _target_weights(codes, weighting) if codes else holdings.copy()
             changes = {code: target.get(code, 0.0) - holdings.get(code, 0.0) for code in set(target) | set(holdings)}
             buy = sum(max(value, 0.0) for value in changes.values())
             sell = sum(max(-value, 0.0) for value in changes.values())
@@ -91,6 +104,7 @@ def run_backtest(
                 "holdings": len(holdings), "buy_turnover": buy,
                 "sell_turnover": sell, "cost_rate": cost_rate,
                 "codes": ",".join(holdings),
+                "weights": ",".join(f"{code}:{weight:.6f}" for code, weight in holdings.items()),
             })
         else:
             gross_return = _weighted_return(holdings, close_return)

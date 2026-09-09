@@ -37,16 +37,6 @@ class SelectionCache:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_selection_date ON selection_results(trade_date)"
             )
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS top20_streaks (
-                    strategy_key TEXT NOT NULL,
-                    trade_date TEXT NOT NULL,
-                    ts_code TEXT NOT NULL,
-                    streak_count INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (strategy_key, trade_date, ts_code)
-                )"""
-            )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=10)
@@ -83,30 +73,29 @@ class SelectionCache:
                 ],
             )
 
-    def get_streaks(self, key: str, trade_date: date) -> dict[str, int] | None:
+    def cached_dates(self, key: str, start_date: date, end_date: date) -> set[date]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT ts_code, streak_count FROM top20_streaks
-                   WHERE strategy_key = ? AND trade_date = ?""",
-                (key, trade_date.isoformat()),
+                """SELECT DISTINCT trade_date FROM selection_results
+                   WHERE strategy_key = ? AND trade_date BETWEEN ? AND ?""",
+                (key, start_date.isoformat(), end_date.isoformat()),
             ).fetchall()
-        if not rows:
-            return None
-        return {str(code): int(count) for code, count in rows}
+        return {date.fromisoformat(str(row[0])) for row in rows}
 
-    def put_streaks(self, key: str, trade_date: date, streaks: dict[str, int]) -> None:
-        created_at = datetime.now(timezone.utc).isoformat()
+    def history(self, key: str, start_date: date, end_date: date) -> pd.DataFrame:
         with self._connect() as connection:
-            connection.execute(
-                "DELETE FROM top20_streaks WHERE strategy_key = ? AND trade_date = ?",
-                (key, trade_date.isoformat()),
-            )
-            connection.executemany(
-                """INSERT INTO top20_streaks
-                   (strategy_key, trade_date, ts_code, streak_count, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                [
-                    (key, trade_date.isoformat(), code, int(count), created_at)
-                    for code, count in streaks.items()
-                ],
-            )
+            rows = connection.execute(
+                """SELECT trade_date, rank, row_json FROM selection_results
+                   WHERE strategy_key = ? AND trade_date BETWEEN ? AND ?
+                   ORDER BY trade_date, rank""",
+                (key, start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        records = []
+        for trade_date_value, rank, row_json in rows:
+            row = json.loads(row_json)
+            records.append({
+                "trade_date": date.fromisoformat(str(trade_date_value)),
+                "rank": int(rank),
+                "ts_code": str(row["ts_code"]),
+            })
+        return pd.DataFrame(records, columns=["trade_date", "rank", "ts_code"])

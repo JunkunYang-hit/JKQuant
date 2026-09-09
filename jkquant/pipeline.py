@@ -23,6 +23,12 @@ from .report import write_csv
 from .strategy import select_stocks
 
 LOGGER = logging.getLogger(__name__)
+CACHE_TOP_K = 50
+RECOMMENDATION_HISTORY_START = date(2025, 9, 1)
+
+
+def _top50_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {**config, "strategy": {**config["strategy"], "top_k": CACHE_TOP_K}}
 
 
 def build_provider(config: dict[str, Any]):
@@ -70,14 +76,18 @@ def run_daily(config: dict[str, Any], end_date: date | None = None) -> tuple[Pat
     store = run_update(config, end_date)
     daily = store.load_daily()
     factors = calculate_factors(daily)
-    selection, summary = select_stocks(
-        factors, store.load_basic(), config, use_current_metadata=True
+    requested_top_k = int(config["strategy"]["top_k"])
+    cache_config = _top50_config(config)
+    top50, summary = select_stocks(
+        factors, store.load_basic(), cache_config, top_k=CACHE_TOP_K,
+        use_current_metadata=True,
     )
-    if selection.empty:
+    if top50.empty:
         raise RuntimeError("过滤后没有足够数据生成选股结果，请检查配置和数据完整性")
+    selection = top50.head(requested_top_k).copy()
     path = write_csv(selection, resolve_path(config, config["report"]["output_dir"]))
     SelectionCache(store.root / "selection_results.sqlite3").put(
-        strategy_key(config), factors["trade_date"].max().date(), selection
+        strategy_key(cache_config), factors["trade_date"].max().date(), top50
     )
     LOGGER.info("报告已生成: %s", path)
     return path, summary
@@ -99,10 +109,14 @@ def selection_for_date(
     started = time.perf_counter()
     store = build_store(config)
     cache = SelectionCache(store.root / "selection_results.sqlite3")
-    key = strategy_key(config)
+    requested_top_k = int(config["strategy"]["top_k"])
+    cache_config = _top50_config(config)
+    key = strategy_key(cache_config)
     cached = cache.get(key, selected_date)
     if cached is not None:
-        return cached, {"cached": True, "elapsed_seconds": time.perf_counter() - started}
+        return cached.head(requested_top_k).copy(), {
+            "cached": True, "elapsed_seconds": time.perf_counter() - started,
+        }
     daily = store.load_daily()
     target = pd.Timestamp(selected_date)
     if not daily["trade_date"].eq(target).any():
@@ -110,58 +124,104 @@ def selection_for_date(
     window = daily[daily["trade_date"].between(target - pd.Timedelta(days=200), target)]
     factors = calculate_factors(window)
     latest_date = daily["trade_date"].max().date()
-    selection, summary = select_stocks(
-        factors, store.load_basic(), config,
+    top50, summary = select_stocks(
+        factors, store.load_basic(), cache_config, top_k=CACHE_TOP_K,
         use_current_metadata=selected_date == latest_date,
     )
-    if selection.empty:
+    if top50.empty:
         raise RuntimeError(f"{selected_date} 没有足够数据生成候选")
-    cache.put(key, selected_date, selection)
+    cache.put(key, selected_date, top50)
     summary.update({"cached": False, "elapsed_seconds": time.perf_counter() - started})
-    return selection, summary
+    return top50.head(requested_top_k).copy(), summary
 
 
-def consecutive_top20_counts(
-    config: dict[str, Any], selected_date: date
-) -> tuple[dict[str, int], bool]:
-    """Count consecutive trading-day Top-20 appearances ending on selected_date."""
+def recommendation_history_stats(
+    config: dict[str, Any], selected_date: date,
+    start_date: date = RECOMMENDATION_HISTORY_START,
+) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """Summarize Top-20 streaks and Top-50 counts from persisted daily results."""
     store = build_store(config)
     cache = SelectionCache(store.root / "selection_results.sqlite3")
-    top20_config = {**config, "strategy": {**config["strategy"], "top_k": 20}}
-    key = strategy_key(top20_config)
-    cached = cache.get_streaks(key, selected_date)
-    if cached is not None:
-        return cached, True
-
     daily = store.load_daily()
-    target = pd.Timestamp(selected_date)
-    history = daily[daily["trade_date"].le(target)]
-    factors = calculate_factors(history)
-    dates = sorted(
-        (pd.Timestamp(value) for value in factors["trade_date"].unique()), reverse=True
-    )
-    latest_date = daily["trade_date"].max().date()
-    basic = store.load_basic()
-    streaks: dict[str, int] = {}
-    active: set[str] | None = None
-    for trade_date in dates:
-        day_factors = factors[factors["trade_date"].eq(trade_date)]
-        selection, _ = select_stocks(
-            day_factors, basic, top20_config, top_k=20,
-            use_current_metadata=trade_date.date() == latest_date,
-        )
-        members = set(selection["ts_code"].astype(str))
-        if active is None:
-            active = members
-            streaks = {code: 1 for code in active}
-            continue
-        active &= members
-        if not active:
-            break
-        for code in active:
-            streaks[code] += 1
-    cache.put_streaks(key, selected_date, streaks)
-    return streaks, False
+    if selected_date < start_date:
+        return {}, {"cached_days": 0, "expected_days": 0}
+    effective_start = start_date
+    expected_dates = [
+        pd.Timestamp(value).date() for value in sorted(daily["trade_date"].unique())
+        if effective_start <= pd.Timestamp(value).date() <= selected_date
+    ]
+    key = strategy_key(_top50_config(config))
+    history = cache.history(key, effective_start, selected_date)
+    if history.empty:
+        return {}, {"cached_days": 0, "expected_days": len(expected_dates)}
+
+    total_counts = history.groupby("ts_code").size().astype(int).to_dict()
+    by_date = {
+        trade_date: day.set_index("ts_code")["rank"].astype(int).to_dict()
+        for trade_date, day in history.groupby("trade_date")
+    }
+    current = by_date.get(selected_date, {})
+    current_top20 = {code for code, rank in current.items() if rank <= 20}
+    streaks = {code: 0 for code in current_top20}
+    for code in current_top20:
+        for trade_date in reversed(expected_dates):
+            if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) <= 20:
+                streaks[code] += 1
+            else:
+                break
+    stats = {
+        code: {
+            "consecutive_top20": int(streaks.get(code, 0)),
+            "top50_count": int(count),
+        }
+        for code, count in total_counts.items()
+    }
+    return stats, {
+        "cached_days": len(by_date), "expected_days": len(expected_dates),
+    }
+
+
+def warm_recommendation_cache(
+    config: dict[str, Any], start_date: date = RECOMMENDATION_HISTORY_START,
+    end_date: date | None = None,
+) -> dict[str, int | str]:
+    """Precompute one canonical Top-50 result for every local trading day."""
+    store = build_store(config)
+    daily = store.load_daily()
+    if daily.empty:
+        raise RuntimeError("本地没有日线数据，请先运行每日更新")
+    last_date = min(end_date or date.today(), daily["trade_date"].max().date())
+    dates = [
+        pd.Timestamp(value) for value in sorted(daily["trade_date"].unique())
+        if start_date <= pd.Timestamp(value).date() <= last_date
+    ]
+    if not dates:
+        raise ValueError("指定区间没有本地交易日")
+    cache_config = _top50_config(config)
+    key = strategy_key(cache_config)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    cached = cache.cached_dates(key, start_date, last_date)
+    missing = [value for value in dates if value.date() not in cached]
+    if missing:
+        factor_start = missing[0] - pd.Timedelta(days=200)
+        source = daily[daily["trade_date"].between(factor_start, dates[-1])]
+        factors = calculate_factors(source)
+        basic = store.load_basic()
+        latest_date = daily["trade_date"].max().date()
+        for index, trade_date in enumerate(missing, start=1):
+            day = factors[factors["trade_date"].eq(trade_date)]
+            top50, _ = select_stocks(
+                day, basic, cache_config, top_k=CACHE_TOP_K,
+                use_current_metadata=trade_date.date() == latest_date,
+            )
+            cache.put(key, trade_date.date(), top50)
+            if index == 1 or index % 10 == 0 or index == len(missing):
+                LOGGER.info("Top-50 预热进度: %d/%d (%s)", index, len(missing), trade_date.date())
+    return {
+        "start_date": start_date.isoformat(), "end_date": last_date.isoformat(),
+        "trading_days": len(dates), "newly_cached_days": len(missing),
+        "already_cached_days": len(dates) - len(missing),
+    }
 
 
 def run_historical_backtest(

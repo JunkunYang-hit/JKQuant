@@ -46,8 +46,9 @@ report:
 backtest:
   start_date: "2025-01-01"
   end_date: null  # null 表示截至本地最新交易日
-  top_k: 20  # 回测持仓数量，可设 1-50；与每日推荐数量相互独立
-  rebalance_days: 5
+  top_k: 10  # 持有排名前 10 的股票
+  weighting: rank_linear  # 排名线性加权：第 1 名权重最高，第 10 名最低
+  rebalance_days: 3
   initial_cash: 1000000
   benchmark: universe_equal_weight
   output_dir: backtests

@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 import yaml
 
-from jkquant.backtest.engine import run_backtest
+from jkquant.backtest.engine import _target_weights, run_backtest
 from jkquant.backtest.reporting import write_backtest_report
 from jkquant.data.demo_provider import DemoProvider
 
@@ -25,3 +25,9 @@ def test_backtest_uses_lagged_signals_and_charges_costs(tmp_path) -> None:
     assert pd.to_datetime(result.trades["signal_date"]).lt(pd.to_datetime(result.trades["trade_date"])).all()
     paths = write_backtest_report(result, tmp_path / "backtest")
     assert all(path.exists() for path in paths.values())
+
+
+def test_rank_linear_weights_favor_higher_ranks() -> None:
+    weights = _target_weights(["A", "B", "C"], "rank_linear")
+    assert weights == {"A": 0.5, "B": 1 / 3, "C": 1 / 6}
+    assert abs(sum(weights.values()) - 1) < 1e-12

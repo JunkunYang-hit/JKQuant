@@ -13,7 +13,8 @@ import streamlit as st
 from jkquant.config import load_config
 from jkquant.data.akshare_provider import AkshareMetadataProvider
 from jkquant.pipeline import (
-    available_selection_dates, consecutive_top20_counts, selection_for_date,
+    RECOMMENDATION_HISTORY_START, available_selection_dates,
+    recommendation_history_stats, selection_for_date,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +41,7 @@ FACTOR_NAMES = {
 TOPK_NAMES = {
     "rank": "排名", "trade_date": "数据日期", "ts_code": "股票代码",
     "name": "证券简称", "close": "收盘价（元）", "amount": "成交额（亿元）",
+    "consecutive_top20": "连续Top-20（天）", "top50_count": "累计Top-50（次）",
     **SCORE_NAMES, **FACTOR_NAMES,
 }
 PERCENT_FACTORS = {
@@ -68,7 +70,7 @@ DAILY_NAMES = {
 TRADE_NAMES = {
     "trade_date": "交易日期", "signal_date": "信号日期", "holdings": "持仓数量",
     "buy_turnover": "买入换手", "sell_turnover": "卖出换手",
-    "cost_rate": "成本率", "codes": "持仓代码",
+    "cost_rate": "成本率", "codes": "持仓代码", "weights": "持仓权重",
 }
 
 
@@ -86,16 +88,20 @@ def _intraday(ts_code: str, selected_date) -> pd.DataFrame:
     return AkshareMetadataProvider().intraday(ts_code, selected_date)
 
 
-def _recommendation_table(page: pd.DataFrame, streaks: dict[str, int]) -> str:
+def _recommendation_table(
+    page: pd.DataFrame, streaks: dict[str, dict[str, int]]
+) -> str:
     columns = [
-        "rank", "ts_code", "name", "total_score", "momentum_score",
+        "rank", "ts_code", "name", "consecutive_top20", "top50_count",
+        "total_score", "momentum_score",
         "trend_score", "risk_score", "liquidity_score", "close", "amount",
     ]
     headers = "".join(f"<th>{html.escape(TOPK_NAMES[column])}</th>" for column in columns)
     rows = []
     for _, row in page.iterrows():
         code = str(row["ts_code"])
-        streak = int(streaks.get(code, 0))
+        stock_stats = streaks.get(code, {})
+        streak = int(stock_stats.get("consecutive_top20", 0))
         name = html.escape(str(row.get("name", code)))
         if streak >= 2:
             name_html = (
@@ -106,6 +112,8 @@ def _recommendation_table(page: pd.DataFrame, streaks: dict[str, int]) -> str:
             name_html = name
         values = {
             "rank": str(int(row["rank"])), "ts_code": html.escape(code), "name": name_html,
+            "consecutive_top20": str(streak),
+            "top50_count": str(int(stock_stats.get("top50_count", 0))),
             "total_score": f"{row['total_score']:.3f}",
             "momentum_score": f"{row['momentum_score']:.3f}",
             "trend_score": f"{row['trend_score']:.3f}",
@@ -117,7 +125,7 @@ def _recommendation_table(page: pd.DataFrame, streaks: dict[str, int]) -> str:
     return f"""
     <style>
       .topk-wrap {{overflow-x:auto; margin-bottom:0.75rem}}
-      .topk-table {{border-collapse:collapse; width:100%; min-width:1050px; font-size:14px}}
+      .topk-table {{border-collapse:collapse; width:100%; min-width:1250px; font-size:14px}}
       .topk-table th,.topk-table td {{border-bottom:1px solid #e5e7eb; padding:9px 10px; text-align:right; white-space:nowrap}}
       .topk-table th {{background:#f6f8fa; color:#374151}}
       .topk-table th:nth-child(2),.topk-table th:nth-child(3),
@@ -156,18 +164,17 @@ def render_topk() -> None:
         frame, calculation = selection_for_date(
             config, selected_date
         )
-        progress.progress(60, text="统计连续进入 Top-20 的交易日数")
-        streaks, streak_cached = consecutive_top20_counts(config, selected_date)
+        progress.progress(60, text="读取历史 Top-50 入选记录")
+        history_stats, history_coverage = recommendation_history_stats(config, selected_date)
         progress.progress(100, text="候选、连续上榜统计和页面数据已准备完成")
         calculation_status.update(label="选股计算完成", state="complete", expanded=False)
     except Exception:
         calculation_status.update(label="选股计算失败", state="error", expanded=True)
         raise
     source = "SQLite 缓存" if calculation["cached"] else "首次计算并写入 SQLite"
-    streak_source = "缓存" if streak_cached else "首次计算"
     st.caption(
         f"结果来源：{source}｜候选耗时：{calculation['elapsed_seconds']:.3f} 秒｜"
-        f"连续上榜：{streak_source}"
+        f"历史 Top-50 缓存：{history_coverage['cached_days']}/{history_coverage['expected_days']} 个交易日"
     )
     score_columns = [column for column in frame if column.endswith("_score")]
     first, second, third, fourth = st.columns(4)
@@ -182,6 +189,25 @@ def render_topk() -> None:
     display["amount_mean_20d"] = display["amount_mean_20d"] / 100_000
     for column in PERCENT_FACTORS:
         display[column] = display[column] * 100
+    display["consecutive_top20"] = display["ts_code"].map(
+        lambda code: history_stats.get(code, {}).get("consecutive_top20", 0)
+    )
+    display["top50_count"] = display["ts_code"].map(
+        lambda code: history_stats.get(code, {}).get("top50_count", 0)
+    )
+    sort_options = [
+        "rank", "ts_code", "name", "consecutive_top20", "top50_count",
+        "total_score", "momentum_score", "trend_score", "risk_score",
+        "liquidity_score", "close", "amount",
+    ]
+    sort_first, sort_second = st.columns([2, 1])
+    sort_column = sort_first.selectbox(
+        "排序字段", sort_options, format_func=lambda value: TOPK_NAMES.get(value, value),
+    )
+    descending = sort_second.toggle("倒序排列", value=sort_column != "rank")
+    display = display.sort_values(
+        sort_column, ascending=not descending, kind="stable", na_position="last"
+    )
     page_size = 10
     page_count = max(1, math.ceil(len(display) / page_size))
     page_number = 1
@@ -193,8 +219,11 @@ def render_topk() -> None:
     page_start = (page_number - 1) * page_size
     page = display.iloc[page_start:page_start + page_size]
     st.caption(f"第 {page_number}/{page_count} 页｜第 {page_start + 1}–{page_start + len(page)} 名")
-    st.markdown(_recommendation_table(page, streaks), unsafe_allow_html=True)
-    st.caption("红色证券简称表示已连续至少 2 个交易日进入 Top-20；鼠标悬停在名称上可查看连续次数。")
+    st.markdown(_recommendation_table(page, history_stats), unsafe_allow_html=True)
+    st.caption(
+        f"统计从 {RECOMMENDATION_HISTORY_START} 开始。红色简称表示连续至少 2 个交易日进入 Top-20；"
+        "连续天数和累计进入 Top-50 次数已直接列为字段，也可悬停红色名称查看。"
+    )
     choices = dict(zip(display["ts_code"], display["name"], strict=False))
     code = st.selectbox(
         "查看单只股票的因子得分", display["ts_code"].tolist(),
@@ -246,7 +275,10 @@ def render_topk() -> None:
     st.altair_chart(score_chart, width="stretch")
     factor_columns = [
         column for column in display
-        if column not in {"rank", "trade_date", "ts_code", "name", "close", "amount", "total_score"}
+        if column not in {
+            "rank", "trade_date", "ts_code", "name", "close", "amount",
+            "total_score", "consecutive_top20", "top50_count",
+        }
         and not column.endswith("_score")
     ]
     def format_factor(column: str) -> str:
@@ -279,7 +311,8 @@ def render_backtest() -> None:
     st.title("策略回测")
     st.info(
         "当前回测测的是一套明确的固定规则：每日按 8 个量价因子打分，选择得分最高的 "
-        "Top-K，只做多并等权持有，每 5 个交易日调仓；信号在 T 日收盘后生成，T+1 执行，"
+        "Top-10，只做多并按排名线性分配权重（第1名最高、第10名最低），每 3 个交易日调仓；"
+        "信号在 T 日收盘后生成，T+1 执行，"
         "并扣除配置中的佣金、印花税和滑点。它不是 AI 预测，也不是某只股票的预测涨幅。"
     )
     with st.expander("指标与专业名词解释", expanded=True):
