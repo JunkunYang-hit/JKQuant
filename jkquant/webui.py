@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import html
+import json
 import math
 import os
+from datetime import date
 from pathlib import Path
 
 import altair as alt
@@ -11,7 +12,6 @@ import pandas as pd
 import streamlit as st
 
 from jkquant.config import load_config
-from jkquant.data.akshare_provider import AkshareMetadataProvider
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
     recommendation_history_stats, selection_for_date,
@@ -83,11 +83,6 @@ def _selection_dates() -> list:
     return available_selection_dates(load_config(PROJECT_ROOT / "config.yaml"))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _intraday(ts_code: str, selected_date) -> pd.DataFrame:
-    return AkshareMetadataProvider().intraday(ts_code, selected_date)
-
-
 def _recommendation_table(
     page: pd.DataFrame, streaks: dict[str, dict[str, int]]
 ) -> str:
@@ -141,23 +136,30 @@ def render_topk() -> None:
     st.title("每日候选（Top-K）")
     st.caption("120 积分模式：使用 Tushare 日线量价选股，当前证券简称由 AKShare 补充。")
     config = load_config(PROJECT_ROOT / "config.yaml")
+    dates = _selection_dates()
+    if not dates:
+        st.info("尚无本地历史行情。请先运行：python scripts/update_data.py")
+        return
     configured_top_k = int(config["strategy"]["top_k"])
     try:
         default_top_k = int(os.getenv("JKQUANT_TOP_K", configured_top_k))
     except ValueError:
         default_top_k = configured_top_k
     default_top_k = min(max(default_top_k, 1), 50)
-    top_k = int(st.number_input(
-        "推荐股票数量 K", min_value=1, max_value=50,
-        value=default_top_k, step=1,
-        help="修改后会按同一套策略重新取得 Top-K；不同 K 的结果分别缓存。",
+    filter_left, filter_right = st.columns(2)
+    top_k = int(filter_left.number_input(
+        "推荐股票数量 K", min_value=1, max_value=50, value=default_top_k, step=1,
+        help="数据库统一缓存 Top-50，修改 K 只截取前 K。",
     ))
+    requested_date = filter_right.date_input(
+        "选择推荐日期", value=date.today(), min_value=dates[0],
+        max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD",
+    )
     config["strategy"]["top_k"] = top_k
-    dates = _selection_dates()
-    if not dates:
-        st.info("尚无本地历史行情。请先运行：python scripts/update_data.py")
-        return
-    selected_date = st.selectbox("选择推荐日期", list(reversed(dates)), format_func=str)
+    available = [value for value in dates if value <= requested_date]
+    selected_date = available[-1] if available else dates[0]
+    if selected_date != requested_date:
+        st.info(f"{requested_date} 不是本地交易日，已显示最近交易日 {selected_date} 的推荐。")
     calculation_status = st.status("正在准备选股计算…", expanded=True)
     progress = st.progress(10, text="读取日线数据和候选缓存")
     try:
@@ -177,11 +179,6 @@ def render_topk() -> None:
         f"历史 Top-50 缓存：{history_coverage['cached_days']}/{history_coverage['expected_days']} 个交易日"
     )
     score_columns = [column for column in frame if column.endswith("_score")]
-    first, second, third, fourth = st.columns(4)
-    first.metric("候选数量", len(frame))
-    second.metric("平均总分", f"{frame['total_score'].mean():.3f}")
-    third.metric("平均成交额", f"{frame['amount'].mean() / 100_000:,.2f} 亿元")
-    fourth.metric("数据日期", str(frame["trade_date"].iloc[0]))
 
     display = frame.copy()
     display["ts_code"] = display["ts_code"].astype(str)
@@ -196,9 +193,9 @@ def render_topk() -> None:
         lambda code: history_stats.get(code, {}).get("top50_count", 0)
     )
     sort_options = [
-        "rank", "ts_code", "name", "consecutive_top20", "top50_count",
-        "total_score", "momentum_score", "trend_score", "risk_score",
-        "liquidity_score", "close", "amount",
+        "rank", "consecutive_top20", "top50_count", "total_score",
+        "momentum_score", "trend_score", "risk_score", "liquidity_score",
+        "close", "amount",
     ]
     sort_first, sort_second = st.columns([2, 1])
     sort_column = sort_first.selectbox(
@@ -210,16 +207,32 @@ def render_topk() -> None:
     )
     page_size = 10
     page_count = max(1, math.ceil(len(display) / page_size))
-    page_number = 1
-    if page_count > 1:
-        page_number = int(st.number_input(
-            "页码", min_value=1, max_value=page_count, value=1, step=1,
-            help=f"共 {page_count} 页，每页最多 {page_size} 只股票。",
-        ))
+    page_context = f"{selected_date}|{top_k}|{sort_column}|{descending}"
+    if st.session_state.get("topk_page_context") != page_context:
+        st.session_state["topk_page_context"] = page_context
+        st.session_state["topk_page"] = 1
+    page_number = min(max(int(st.session_state.get("topk_page", 1)), 1), page_count)
+    st.session_state["topk_page"] = page_number
     page_start = (page_number - 1) * page_size
     page = display.iloc[page_start:page_start + page_size]
-    st.caption(f"第 {page_number}/{page_count} 页｜第 {page_start + 1}–{page_start + len(page)} 名")
     st.markdown(_recommendation_table(page, history_stats), unsafe_allow_html=True)
+    page_left, page_middle, page_right = st.columns([1, 2, 1])
+    if page_left.button(
+        "◀ 上一页", disabled=page_number <= 1, use_container_width=True,
+    ):
+        st.session_state["topk_page"] = page_number - 1
+        st.rerun()
+    page_middle.markdown(
+        f"<div style='text-align:center;padding-top:0.45rem'>"
+        f"第 {page_number} / {page_count} 页　·　第 {page_start + 1}–{page_start + len(page)} 条"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    if page_right.button(
+        "下一页 ▶", disabled=page_number >= page_count, use_container_width=True,
+    ):
+        st.session_state["topk_page"] = page_number + 1
+        st.rerun()
     st.caption(
         f"统计从 {RECOMMENDATION_HISTORY_START} 开始。红色简称表示连续至少 2 个交易日进入 Top-20；"
         "连续天数和累计进入 Top-50 次数已直接列为字段，也可悬停红色名称查看。"
@@ -230,37 +243,6 @@ def render_topk() -> None:
         format_func=lambda value: f"{value}｜{choices.get(value, value)}",
     )
     row = frame.loc[frame["ts_code"].astype(str).eq(code)].iloc[0]
-    st.subheader("日内分时图")
-    if selected_date not in set(dates[-5:]):
-        st.info("免费 1 分钟数据仅覆盖最近 5 个交易日，请选择较近日期查看。")
-    elif st.button("加载该股票的 1 分钟分时图", type="secondary"):
-        try:
-            with st.spinner("正在从 AKShare 获取分钟行情…"):
-                minute = _intraday(code, selected_date)
-            if minute.empty:
-                st.warning("该日期没有取得分钟行情，可能是数据源尚未更新或接口临时不可用。")
-            else:
-                price_columns = ["close"] + (["average"] if "average" in minute and minute["average"].notna().any() else [])
-                price = minute[["datetime", *price_columns]].rename(
-                    columns={"close": "价格", "average": "均价"}
-                ).melt("datetime", var_name="曲线", value_name="价格（元）")
-                price_chart = alt.Chart(price).mark_line().encode(
-                    x=alt.X("datetime:T", title="时间", axis=alt.Axis(format="%H:%M")),
-                    y=alt.Y("价格（元）:Q", scale=alt.Scale(zero=False)),
-                    color=alt.Color("曲线:N", scale=alt.Scale(
-                        domain=["价格", "均价"], range=["#d62728", "#f2a900"]
-                    )),
-                    tooltip=[alt.Tooltip("datetime:T", title="时间", format="%H:%M"), "曲线:N", alt.Tooltip("价格（元）:Q", format=".2f")],
-                ).properties(height=300)
-                volume_chart = alt.Chart(minute).mark_bar(color="#6b93c6").encode(
-                    x=alt.X("datetime:T", title="时间", axis=alt.Axis(format="%H:%M")),
-                    y=alt.Y("volume:Q", title="成交量（手）"),
-                    tooltip=[alt.Tooltip("datetime:T", title="时间", format="%H:%M"), alt.Tooltip("volume:Q", title="成交量（手）", format=",")],
-                ).properties(height=120)
-                st.altair_chart(alt.vconcat(price_chart, volume_chart).resolve_scale(x="shared"), width="stretch")
-                st.caption("数据源：AKShare/东方财富。1 分钟数据不复权，仅提供近期交易日；点击按钮时按需获取。")
-        except Exception as exc:
-            st.warning(f"分钟行情暂时获取失败，不影响日线选股结果：{exc}")
     chart = pd.DataFrame(
         {
             "指标": [SCORE_NAMES.get(column, column) for column in score_columns],
