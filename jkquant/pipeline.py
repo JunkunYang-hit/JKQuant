@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from .backtest.engine import run_backtest as execute_backtest
 from .backtest.reporting import write_backtest_report
+from .backtest.strategy_lab import run_experiments
 from .backtest.strategy_suite import (
     BASE_STRATEGIES, STRATEGIES, run_event_strategy, write_strategy_result,
     write_suite_index,
@@ -496,3 +497,53 @@ def run_strategy_suite(
     })
     LOGGER.info("多策略回测汇总: %s", index_path)
     return index_path, summaries
+
+
+def run_strategy_lab(
+    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
+) -> tuple[Path, pd.DataFrame]:
+    """Run the best-strategy ablation grid entirely from local cached data."""
+    settings = config.get("strategy_lab", {})
+    suite_settings = config.get("strategy_suite", {})
+    start = start_date or date.fromisoformat(
+        settings.get("start_date", suite_settings.get("start_date", "2025-09-01"))
+    )
+    configured_end = settings.get("end_date")
+    requested_end = end_date or (
+        date.fromisoformat(configured_end) if configured_end else date.today()
+    )
+    store = build_store(config)
+    daily = store.load_daily()
+    if daily.empty:
+        raise RuntimeError("本地没有日线数据，请先运行每日更新")
+    end = min(requested_end, daily["trade_date"].max().date())
+    if start >= end:
+        raise ValueError("策略试验场开始日期必须早于本地最新交易日")
+    warm_recommendation_cache(config, start, end)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    rankings = cache.history(strategy_key(_top50_config(config)), start, end)
+    expected_dates = {
+        pd.Timestamp(value).date() for value in daily["trade_date"].unique()
+        if start <= pd.Timestamp(value).date() <= end
+    }
+    if set(rankings["trade_date"].unique()) != expected_dates:
+        raise RuntimeError("策略试验场所需的 Top-50 历史信号缓存不完整")
+    basic = store.load_basic()
+    names = (
+        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
+        .set_index("ts_code")["name"].astype(str).to_dict()
+        if "name" in basic else {}
+    )
+    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
+        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
+        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
+        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
+        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
+    output = resolve_path(
+        config, settings.get("output_dir", "backtests/strategy_lab")
+    ) / f"{start}_{end}"
+    return run_experiments(
+        daily, rankings, names, start, end,
+        float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],
+        settings, output,
+    )

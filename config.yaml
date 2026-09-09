@@ -66,3 +66,14 @@ strategy_suite:
   record_profit: 0.20
   # 用原始 11 套策略横向测试止盈；null 表示不设固定止盈。
   take_profit_sweep: [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, null]
+
+strategy_lab:
+  start_date: "2025-09-01"
+  end_date: null
+  output_dir: backtests/strategy_lab
+  take_profit_start: 0.20
+  take_profit_end: 0.40
+  take_profit_step: 0.02
+  confirmation_days: [1, 2, 3]
+  entry_ranks: [20, 25]
+  exit_ranks: [10, 15, 20, 25]

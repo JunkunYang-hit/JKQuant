@@ -60,20 +60,18 @@ def _entry_weights(candidates: list[tuple[str, int]], spec: StrategySpec) -> dic
 
 
 def _signal_snapshots(rankings: pd.DataFrame, spec: StrategySpec) -> dict[date, dict[str, Any]]:
-    streak5: dict[str, int] = {}
-    streak20: dict[str, int] = {}
-    streak50: dict[str, int] = {}
+    required_streaks: dict[str, int] = {}
     snapshots: dict[date, dict[str, Any]] = {}
     for trade_date, day in rankings.sort_values(["trade_date", "rank"]).groupby("trade_date"):
         ranks = day.set_index("ts_code")["rank"].astype(int).to_dict()
-        current5 = {code for code, rank in ranks.items() if rank <= 5}
-        current20 = {code for code, rank in ranks.items() if rank <= 20}
-        current50 = set(ranks)
-        streak5 = {code: streak5.get(code, 0) + 1 for code in current5}
-        streak20 = {code: streak20.get(code, 0) + 1 for code in current20}
-        streak50 = {code: streak50.get(code, 0) + 1 for code in current50}
-        required = streak5 if spec.consecutive_rank == 5 else streak20 if spec.consecutive_rank == 20 else streak50
-        snapshots[pd.Timestamp(trade_date).date()] = {"ranks": ranks, "streaks": required.copy()}
+        if spec.consecutive_rank is None:
+            required_streaks = {}
+        else:
+            current = {code for code, rank in ranks.items() if rank <= spec.consecutive_rank}
+            required_streaks = {code: required_streaks.get(code, 0) + 1 for code in current}
+        snapshots[pd.Timestamp(trade_date).date()] = {
+            "ranks": ranks, "streaks": required_streaks.copy(),
+        }
     return snapshots
 
 

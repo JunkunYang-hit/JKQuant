@@ -20,6 +20,7 @@ from jkquant.pipeline import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_ROOT = PROJECT_ROOT / "reports"
 BACKTESTS_ROOT = PROJECT_ROOT / "backtests"
+STRATEGY_LAB_ROOT = BACKTESTS_ROOT / "strategy_lab"
 
 SCORE_NAMES = {
     "total_score": "综合得分",
@@ -599,6 +600,77 @@ def render_backtest() -> None:
     _render_glossary()
 
 
+def render_strategy_lab() -> None:
+    st.title("策略试验场")
+    st.caption(
+        "围绕当前最佳规则做参数消融：连续3次进入 Top20/Top25，组合不同退出排名、"
+        "卖出确认次数和固定止盈。全部结果均为同一区间的样本内比较。"
+    )
+    folders = sorted(
+        {path.parent for path in STRATEGY_LAB_ROOT.glob("*/progress.json")}, reverse=True,
+    )
+    if not folders:
+        st.info("尚无试验结果。请运行：python scripts/run_strategy_lab.py")
+        return
+    folder = st.selectbox("试验批次", folders, format_func=lambda value: value.name)
+    progress = json.loads((folder / "progress.json").read_text(encoding="utf-8"))
+    completed = int(progress.get("completed", 0))
+    total = int(progress.get("total", 0))
+    ratio = completed / total if total else 0.0
+    status_names = {"running": "运行中", "completed": "已完成", "failed": "失败"}
+    st.progress(ratio, text=f"{status_names.get(progress.get('status'), progress.get('status'))}：{completed}/{total}")
+    columns = st.columns(4)
+    columns[0].metric("已完成组合", completed)
+    columns[1].metric("总组合数", total)
+    columns[2].metric("完成比例", f"{ratio:.1%}")
+    elapsed = float(progress.get("elapsed_seconds", 0))
+    eta = elapsed / completed * (total - completed) if completed else 0
+    columns[3].metric("预计剩余", f"{eta / 60:.1f} 分钟" if progress.get("status") == "running" else "0 分钟")
+    st.caption(
+        f"区间：{progress.get('start_date')} 至 {progress.get('end_date')}｜"
+        f"最后更新：{progress.get('updated_at')}｜当前组合：{progress.get('current_experiment') or '无'}"
+    )
+    if progress.get("status") == "failed":
+        st.error(progress.get("error", "试验进程失败"))
+    if st.button("刷新试验进度"):
+        st.rerun()
+    results_path = folder / progress.get("results_file", "results.csv")
+    if not results_path.exists():
+        st.info("首个参数组合尚未完成。")
+        return
+    results = pd.read_csv(results_path).sort_values("cumulative_return", ascending=False).head(20).copy()
+    results.insert(0, "排名", range(1, len(results) + 1))
+    display = results.rename(columns={
+        "strategy_name": "试验规则", "entry_rank": "连续入选范围", "exit_rank": "跌出范围",
+        "confirmation_days": "卖出确认次数", "take_profit": "止盈阈值",
+        "cumulative_return": "累计收益", "annualized_return": "年化收益",
+        "benchmark_return": "基准收益", "excess_return": "超额收益",
+        "sharpe_ratio": "Sharpe", "max_drawdown": "最大回撤",
+        "annualized_volatility": "年化波动", "total_trade_count": "交易次数",
+        "profitable_trade_rate": "交易胜率", "average_holding_days": "平均持有交易日",
+        "take_profit_count": "止盈次数", "open_positions": "期末持仓",
+        "runtime_seconds": "计算耗时（秒）",
+    })
+    columns_to_show = [
+        "排名", "试验规则", "连续入选范围", "跌出范围", "卖出确认次数", "止盈阈值",
+        "累计收益", "年化收益", "超额收益", "Sharpe", "最大回撤", "年化波动",
+        "交易次数", "交易胜率", "平均持有交易日", "止盈次数",
+    ]
+    st.subheader("当前收益率前二十")
+    st.dataframe(
+        display[columns_to_show].style.format({
+            "止盈阈值": "{:.0%}", "累计收益": "{:.2%}", "年化收益": "{:.2%}",
+            "超额收益": "{:.2%}", "Sharpe": "{:.3f}", "最大回撤": "{:.2%}",
+            "年化波动": "{:.2%}", "交易胜率": "{:.2%}", "平均持有交易日": "{:.1f}",
+        }), width="stretch", hide_index=True, height=760,
+    )
+    st.bar_chart(results.set_index("experiment_id")[["cumulative_return"]])
+    st.warning(
+        "前二十名是在同一段历史数据上从大量组合中筛出的样本内结果，存在明显的数据挖掘和参数过拟合风险。"
+        "最终参数必须用未参与本次排名的后续数据做样本外验证。"
+    )
+
+
 def render_system_help() -> None:
     st.title("系统说明")
     st.subheader("系统现在如何运行")
@@ -640,7 +712,7 @@ def render_system_help() -> None:
 def main() -> None:
     st.set_page_config(page_title="JKQuant", page_icon="📈", layout="wide")
     st.sidebar.title("JKQuant")
-    page = st.sidebar.radio("页面", ["每日候选", "策略总览", "策略分析", "系统说明"])
+    page = st.sidebar.radio("页面", ["每日候选", "策略总览", "策略分析", "策略试验场", "系统说明"])
     st.sidebar.divider()
     st.sidebar.caption("本地只读展示界面，不执行自动交易。")
     if st.sidebar.button("刷新页面"):
@@ -649,6 +721,8 @@ def main() -> None:
         render_topk()
     elif page == "策略总览":
         render_strategy_overview()
+    elif page == "策略试验场":
+        render_strategy_lab()
     elif page == "策略分析":
         render_backtest()
     else:
