@@ -49,6 +49,7 @@ def run_update(
     update_data(
         build_provider(config), store, end_date or date.today(), int(config["data"]["history_days"]),
         start_date=start_date, basic_refresh_days=int(config["data"].get("basic_refresh_days", 7)),
+        fetch_stock_basic=bool(config["data"].get("fetch_stock_basic", True)),
     )
     return store
 

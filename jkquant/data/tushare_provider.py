@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import logging
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any, Callable
 
@@ -39,19 +41,22 @@ class TushareProvider(DataProvider):
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
         self._last_request_at = 0.0
+        self._rate_lock = threading.Lock()
 
     def _call(self, function: Callable[..., pd.DataFrame], **kwargs: Any) -> pd.DataFrame:
         """Rate-limit every API call and retry temporary server/rate errors."""
         for attempt in range(self.max_retries + 1):
-            wait = self.min_interval - (time.monotonic() - self._last_request_at)
-            if wait > 0:
-                time.sleep(wait)
+            # Reserve a request slot under a lock, then perform network I/O
+            # outside the lock so slow responses do not reduce throughput.
+            with self._rate_lock:
+                wait = self.min_interval - (time.monotonic() - self._last_request_at)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_request_at = time.monotonic()
             try:
                 result = function(**kwargs)
-                self._last_request_at = time.monotonic()
                 return result
             except Exception as exc:
-                self._last_request_at = time.monotonic()
                 message = str(exc).lower()
                 if any(marker in message for marker in ("权限", "积分", "token", "permission")):
                     raise RuntimeError(f"Tushare 权限错误: {exc}") from exc
@@ -80,12 +85,15 @@ class TushareProvider(DataProvider):
         # 节假日返回空表；按交易日取全市场也不会触发单次 6000 行上限。
         dates = pd.bdate_range(start_date, end_date)
         frames = []
-        for index, value in enumerate(dates, start=1):
-            frame = self._call(self.pro.daily, trade_date=value.strftime("%Y%m%d"))
-            if not frame.empty:
-                frames.append(frame)
-            if index % 20 == 0 or index == len(dates):
-                LOGGER.info("Tushare 日线进度: %d/%d 个工作日", index, len(dates))
+        def fetch(value: pd.Timestamp) -> pd.DataFrame:
+            return self._call(self.pro.daily, trade_date=value.strftime("%Y%m%d"))
+
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="tushare") as executor:
+            for index, frame in enumerate(executor.map(fetch, dates), start=1):
+                if not frame.empty:
+                    frames.append(frame)
+                if index % 20 == 0 or index == len(dates):
+                    LOGGER.info("Tushare 日线进度: %d/%d 个工作日", index, len(dates))
         frames = [frame for frame in frames if not frame.empty]
         if not frames:
             return pd.DataFrame()

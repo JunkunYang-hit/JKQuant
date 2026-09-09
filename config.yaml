@@ -1,6 +1,8 @@
 data:
   # demo 可直接运行；准备实盘时改为 tushare，并设置环境变量 TUSHARE_TOKEN。
   provider: tushare
+  access_tier: 120
+  fetch_stock_basic: false  # 120 积分仅使用 daily；不调用高积分元数据接口
   token_env: TUSHARE_TOKEN
   cache_dir: data/cache
   history_days: 220
@@ -14,7 +16,7 @@ data:
 
 market:
   universe: all_a
-  exclude_st: true
+  exclude_st: false  # 120 积分的 daily 不含股票名称，无法可靠识别 ST
   min_list_days: 120
   min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
 

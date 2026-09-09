@@ -24,8 +24,11 @@ def select_stocks(
     if "delist_date" in latest:
         delist_date = pd.to_datetime(latest["delist_date"], errors="coerce")
         latest = latest[delist_date.isna() | delist_date.gt(selection_date)]
-    list_days = (selection_date - pd.to_datetime(latest["list_date"])).dt.days
-    latest = latest[list_days.ge(int(market["min_list_days"]))]
+    list_days = (selection_date - pd.to_datetime(latest["list_date"], errors="coerce")).dt.days
+    derived = latest.get("metadata_source", pd.Series("tushare", index=latest.index)).eq("daily_derived")
+    minimum_observations = int(int(market["min_list_days"]) * 5 / 7)
+    enough_history = latest["history_count"].ge(minimum_observations)
+    latest = latest[list_days.ge(int(market["min_list_days"])) | (derived & enough_history)]
     latest = latest[latest["amount"].gt(float(market["min_amount"]))]
     # Tushare 停牌日没有 daily 行；成交量为零也视为不可交易。
     latest = latest[latest["vol"].gt(0)]
