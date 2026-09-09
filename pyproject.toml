@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jkquant"
+version = "0.1.0"
+description = "A-share daily multi-factor stock selector"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyarrow>=12",
+  "PyYAML>=6",
+  "tushare>=1.4",
+]
+
+[project.scripts]
+jkquant = "jkquant.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["jkquant*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

@@ -1,0 +1,34 @@
+data:
+  # demo 可直接运行；准备实盘时改为 tushare，并设置环境变量 TUSHARE_TOKEN。
+  provider: demo
+  cache_dir: data/cache
+  history_days: 220
+  demo_stock_count: 100
+  demo_seed: 20260909
+
+market:
+  universe: all_a
+  exclude_st: true
+  min_list_days: 120
+  min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
+
+strategy:
+  top_k: 20
+  factors:
+    return_5d: {category: momentum, direction: 1, weight: 0.35}
+    return_20d: {category: momentum, direction: 1, weight: 0.65}
+    close_ma20: {category: trend, direction: 1, weight: 0.60}
+    ma5_ma20: {category: trend, direction: 1, weight: 0.40}
+    volatility_20d: {category: risk, direction: -1, weight: 0.60}
+    max_drawdown_20d: {category: risk, direction: -1, weight: 0.40}
+    amount_mean_20d: {category: liquidity, direction: 1, weight: 0.70}
+    amount_ratio_5_20: {category: liquidity, direction: 1, weight: 0.30}
+  category_weights:
+    momentum: 0.40
+    trend: 0.25
+    risk: 0.20
+    liquidity: 0.15
+
+report:
+  output_dir: reports
+

@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pandas as pd
+
+
+def select_stocks(
+    factors: pd.DataFrame, basic: pd.DataFrame, config: dict[str, Any]
+) -> tuple[pd.DataFrame, dict[str, int | str]]:
+    """Filter and rank the latest available cross-section."""
+    if factors.empty:
+        raise ValueError("没有可用于选股的日线数据")
+    selection_date = factors["trade_date"].max()
+    latest = factors.loc[factors["trade_date"].eq(selection_date)].copy()
+    universe_count = len(latest)
+    latest = latest.merge(basic, on="ts_code", how="left")
+    market = config["market"]
+    if market.get("exclude_st", True):
+        latest = latest[~latest["name"].fillna("").str.upper().str.contains("ST")]
+    latest = latest[latest["list_status"].fillna("L").eq("L")]
+    list_days = (selection_date - pd.to_datetime(latest["list_date"])).dt.days
+    latest = latest[list_days.ge(int(market["min_list_days"]))]
+    latest = latest[latest["amount"].gt(float(market["min_amount"]))]
+    # Tushare 停牌日没有 daily 行；成交量为零也视为不可交易。
+    latest = latest[latest["vol"].gt(0)]
+
+    factor_config = config["strategy"]["factors"]
+    required = list(factor_config)
+    latest = latest.dropna(subset=required).copy()
+    eligible_count = len(latest)
+    category_columns: dict[str, list[tuple[str, float]]] = {}
+    for factor, spec in factor_config.items():
+        rank = latest[factor].rank(method="average", pct=True)
+        score_column = f"{factor}_score"
+        latest[score_column] = rank if int(spec["direction"]) == 1 else 1 - rank
+        category_columns.setdefault(spec["category"], []).append((score_column, float(spec["weight"])))
+
+    for category, columns in category_columns.items():
+        weight_sum = sum(weight for _, weight in columns)
+        latest[f"{category}_score"] = sum(latest[col] * weight for col, weight in columns) / weight_sum
+    weights = config["strategy"]["category_weights"]
+    latest["total_score"] = sum(latest[f"{name}_score"] * weight for name, weight in weights.items())
+    latest = latest.sort_values("total_score", ascending=False).head(int(config["strategy"]["top_k"]))
+    latest.insert(0, "rank", range(1, len(latest) + 1))
+    columns = ["rank", "trade_date", "ts_code", "name", "total_score"]
+    columns += [f"{name}_score" for name in weights]
+    columns += ["close", "amount"] + required
+    summary: dict[str, int | str] = {
+        "trade_date": selection_date.strftime("%Y-%m-%d"),
+        "universe_count": universe_count,
+        "eligible_count": eligible_count,
+    }
+    return latest[columns].reset_index(drop=True), summary
