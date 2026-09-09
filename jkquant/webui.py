@@ -79,7 +79,7 @@ TRADE_NAMES = {
     "holding_period": "持股时间区间",
     "holding_trading_days": "持有交易日", "entry_price": "买入价",
     "exit_price": "结束价", "price_change": "价格变化", "net_return": "净收益",
-    "exit_reason": "结束原因", "crossed20_date": "20%止盈日期", "status": "状态",
+    "exit_reason": "结束原因", "crossed20_date": "止盈触发日期", "status": "状态",
     "max_gain": "持有期最大盈利",
     "max_drawdown_during_holding": "持有期最大不利波动",
 }
@@ -362,7 +362,7 @@ def render_strategy_overview() -> None:
             "盈利次数": metrics.get("profitable_trade_count"),
             "亏损次数": metrics.get("losing_trade_count"),
             "交易胜率": metrics.get("profitable_trade_rate"),
-            "20%止盈": metrics.get("take_profit_count", 0),
+            "止盈次数": metrics.get("take_profit_count", 0),
             "平均持有交易日": metrics.get("average_holding_days", 0),
             "涨停未买入": metrics.get("limit_up_buy_blocked_count", 0),
             "跌停未卖出": metrics.get("limit_down_sell_blocked_count", 0),
@@ -383,8 +383,8 @@ def render_strategy_overview() -> None:
     sweep_path = folder / suite.get("take_profit_sweep_file", "take_profit_sweep.csv")
     if sweep_path.exists():
         sweep = pd.read_csv(sweep_path)
-        st.subheader("止盈阈值对照（原始 11 套策略）")
-        st.caption("用于隔离止盈阈值影响；两日确认版本不参与该表，避免同时改变两个变量。‘不设止盈’是对照组。")
+        st.subheader("止盈阈值对照（保留的原始策略）")
+        st.caption("用于隔离止盈阈值影响；两日确认和固定30%止盈版本不参与该表，避免同时改变多个变量。‘不设止盈’是对照组。")
         threshold_summary = pd.DataFrame(suite.get("take_profit_sweep_summary", [])).rename(columns={
             "threshold": "止盈阈值", "mean_cumulative_return": "平均累计收益",
             "median_cumulative_return": "累计收益中位数", "positive_strategy_count": "盈利策略数",
@@ -409,10 +409,11 @@ def render_strategy_overview() -> None:
         event_items = [item for item in suite["strategies"] if item["strategy_id"] != "baseline_top10_3d"]
         item_map = {item["strategy_id"]: item for item in event_items}
         base_items = [item for item in event_items if not item["strategy_id"].endswith("_confirm2")]
+        paired_items = [item for item in base_items if f"{item['strategy_id']}_confirm2" in item_map]
         improved = sum(
             item_map[f"{item['strategy_id']}_confirm2"]["metrics"]["cumulative_return"]
             > item["metrics"]["cumulative_return"]
-            for item in base_items
+            for item in paired_items
         )
         best_threshold = max(
             suite.get("take_profit_sweep_summary", []),
@@ -428,16 +429,17 @@ def render_strategy_overview() -> None:
             "20% 更可能过早截断趋势，但单一历史区间不能证明未来最优。\n"
             f"- **入场质量与反复换手是主要问题**：原始策略平均交易胜率约 **{mean_win_rate:.1%}**，"
             f"按平均盈利/亏损幅度估算的盈亏平衡胜率约为 **{break_even:.1%}**。\n"
-            f"- **延迟一天退出有选择性价值**：11 个配对中有 **{improved} 个**改善、{11-improved} 个变差，"
+            f"- **延迟一天退出有选择性价值**：当前保留的 {len(paired_items)} 个完整配对中有 **{improved} 个**改善、{len(paired_items)-improved} 个变差，"
             "不能把两日确认统一视为更优。\n"
             "- **成交量已经纳入**：当前流动性类别权重为 15%，包括 20 日平均成交额和 5/20 日成交额比；"
             "它目前是流动性/活跃度评分，不是放量突破确认，后者应另做独立变量测试。"
         )
     selected = st.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
+    threshold = selected["metrics"].get("take_profit_threshold")
     threshold_note = (
-        "该新增策略在盈利达到20%时记录完整事件并止盈。"
-        if selected["metrics"].get("threshold_enabled", True)
-        else "该策略是原三日调仓基准，不应用20%止盈规则。"
+        f"该策略在盈利达到{threshold:.0%}时记录完整事件并止盈。"
+        if selected["metrics"].get("threshold_enabled", True) and threshold is not None
+        else "该策略不应用固定止盈规则。"
     )
     st.info(selected["description"] + " " + threshold_note)
     st.caption("进入“策略分析”页面可查看所选策略的净值、回撤、逐日数据、交易区间和阈值事件。")
@@ -458,7 +460,7 @@ def _render_glossary() -> None:
             "- **最大回撤**：越接近0越好。10%以内较低，10%～20%中等，30%以上通常属于高回撤。\n"
             "- **年化波动率**：越低越稳定；股票策略可粗略将15%以下视为较低、15%～30%中等、30%以上较高。\n"
             "- **日胜率**：正收益交易日占比；越高通常越好，但还必须结合每次盈亏幅度。\n"
-            "- **20%止盈**：持仓期间最高价首次达到买入价上方20%时记录并模拟卖出；事件表同时记录该次交易最终结果。\n"
+            "- **固定止盈**：持仓期间最高价首次达到设定阈值时记录并模拟卖出；当前普通策略为20%，半仓策略为30%。\n"
             "- **总交易次数**：已经完成买入和卖出的完整交易数；期末仍持有的仓位不计入。\n"
             "- **盈利/亏损次数**：按扣除买卖成本后的单笔净收益大于0或小于0统计，等于0单列为持平。\n"
             "- **交易胜率**：盈利交易次数÷总已平仓交易次数；持有中的仓位不计入。\n"
@@ -503,7 +505,9 @@ def render_backtest() -> None:
         columns[2].metric("亏损次数", int(metrics.get("losing_trade_count", 0)))
         columns[3].metric("交易胜率", _percent(metrics.get("profitable_trade_rate", 0)))
         columns = st.columns(4)
-        columns[0].metric("20%止盈次数", int(metrics.get("take_profit_count", 0)))
+        threshold = metrics.get("take_profit_threshold")
+        threshold_label = f"{threshold:.0%}止盈次数" if threshold is not None else "止盈次数"
+        columns[0].metric(threshold_label, int(metrics.get("take_profit_count", 0)))
         columns[1].metric("持平次数", int(metrics.get("flat_trade_count", 0)))
         columns[2].metric("平均持有交易日", f"{metrics.get('average_holding_days', 0):.1f}")
         columns[3].metric("期末持仓", int(metrics.get("open_positions", 0)))
@@ -536,7 +540,7 @@ def render_backtest() -> None:
         st.subheader("盈利阈值事件")
         events = pd.read_csv(events_path).rename(columns=EVENT_NAMES)
         if events.empty:
-            st.info("该策略没有出现触发20%止盈的持仓事件。")
+            st.info("该策略没有出现触发固定止盈阈值的持仓事件。")
         else:
             if "最高涨幅" in events:
                 events["最高涨幅"] = events["最高涨幅"].map(lambda value: f"{value:.2%}")

@@ -323,9 +323,12 @@ def run_strategy_suite(
         baseline.metrics["strategy_name"], baseline.metrics["cumulative_return"] * 100,
     )
     for spec in STRATEGIES:
+        effective_take_profit = (
+            spec.fixed_take_profit if spec.fixed_take_profit is not None else take_profit
+        )
         result, trades, events, metrics = run_event_strategy(
             daily, rankings, names, spec, start, end, initial_cash, costs,
-            take_profit=take_profit, record_profit=record_profit,
+            take_profit=effective_take_profit, record_profit=effective_take_profit,
         )
         metrics["threshold_enabled"] = True
         metrics["st_filter_mode"] = "current_name_approximation"
