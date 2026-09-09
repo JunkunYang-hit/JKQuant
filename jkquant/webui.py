@@ -14,7 +14,7 @@ import streamlit as st
 from jkquant.config import load_config
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
-    recommendation_history_stats, selection_for_date,
+    best_strategy_recommendations, recommendation_history_stats, selection_for_date,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -222,6 +222,49 @@ def render_topk() -> None:
         f"结果来源：{source}｜候选耗时：{calculation['elapsed_seconds']:.3f} 秒｜"
         f"历史 Top-50 缓存：{history_coverage['cached_days']}/{history_coverage['expected_days']} 个交易日"
     )
+    st.subheader("最佳五策略联合推荐")
+    joint, joint_meta = best_strategy_recommendations(config, selected_date, top_n=5)
+    strategies = pd.DataFrame(joint_meta.get("strategies", [])).rename(columns={
+        "name": "入选策略", "cumulative_return": "历史累计收益",
+    })
+    if not strategies.empty:
+        with st.expander("查看本次采用的五个策略"):
+            st.dataframe(
+                strategies[["入选策略", "历史累计收益"]].style.format({"历史累计收益": "{:.2%}"}),
+                width="stretch", hide_index=True,
+            )
+        positive_count = int(strategies["历史累计收益"].gt(0).sum())
+        if positive_count < len(strategies):
+            st.warning(
+                f"这五个策略只是当前回测中的相对前五名，其中仅 {positive_count}/{len(strategies)} "
+                "在该回测区间取得正收益。联合候选应作为进一步研究清单，不能视为已验证的买入建议。"
+            )
+    st.caption(
+        f"回测批次：{joint_meta.get('suite', '无')}。使用 {selected_date} 收盘后可知信息生成，"
+        "对应下一交易日的候选信号；实际开盘仍需检查涨停、停牌及 ST 状态。"
+    )
+    if joint.empty:
+        st.info(joint_meta.get("reason", "所选日期没有联合候选。"))
+    else:
+        joint_display = joint.rename(columns={
+            "joint_rank": "联合排序", "ts_code": "股票代码", "name": "证券简称",
+            "rank": "当日总排名", "total_score": "综合得分",
+            "consecutive_top20": "连续Top20（天）", "consecutive_top50": "连续Top50（天）",
+            "strategy_support_count": "策略支持数", "supporting_strategies": "支持策略",
+            "best_supporting_return": "支持策略最佳历史收益",
+            "mean_supporting_return": "支持策略平均历史收益",
+        })
+        st.dataframe(
+            joint_display.style.format({
+                "综合得分": "{:.3f}", "支持策略最佳历史收益": "{:.2%}",
+                "支持策略平均历史收益": "{:.2%}",
+            }), width="stretch", hide_index=True, height=430,
+        )
+        st.caption(
+            "联合排序先看策略支持数，再看当日总排名和综合得分。原版与两日确认版可能共享同一入场规则，"
+            "因此策略支持数是规则支持程度，不是五个相互独立模型的投票，也不是上涨概率。"
+        )
+    st.divider()
     score_columns = [column for column in frame if column.endswith("_score")]
 
     display = frame.copy()

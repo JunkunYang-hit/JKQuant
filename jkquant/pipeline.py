@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import date, timedelta
@@ -165,17 +166,35 @@ def recommendation_history_stats(
         for trade_date, day in history.groupby("trade_date")
     }
     current = by_date.get(selected_date, {})
+    current_top5 = {code for code, rank in current.items() if rank <= 5}
     current_top20 = {code for code, rank in current.items() if rank <= 20}
+    current_top50 = set(current)
+    streaks5 = {code: 0 for code in current_top5}
     streaks = {code: 0 for code in current_top20}
+    streaks50 = {code: 0 for code in current_top50}
+    for code in current_top5:
+        for trade_date in reversed(expected_dates):
+            if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) <= 5:
+                streaks5[code] += 1
+            else:
+                break
     for code in current_top20:
         for trade_date in reversed(expected_dates):
             if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) <= 20:
                 streaks[code] += 1
             else:
                 break
+    for code in current_top50:
+        for trade_date in reversed(expected_dates):
+            if code in by_date.get(trade_date, {}):
+                streaks50[code] += 1
+            else:
+                break
     stats = {
         code: {
+            "consecutive_top5": int(streaks5.get(code, 0)),
             "consecutive_top20": int(streaks.get(code, 0)),
+            "consecutive_top50": int(streaks50.get(code, 0)),
             "top50_count": int(count),
         }
         for code, count in total_counts.items()
@@ -185,6 +204,97 @@ def recommendation_history_stats(
     }
 
 
+def best_strategy_recommendations(
+    config: dict[str, Any], selected_date: date, top_n: int = 5,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build next-open candidates supported by the best backtested event strategies."""
+    suite_root = resolve_path(
+        config, config.get("strategy_suite", {}).get("output_dir", "backtests/strategy_suite")
+    )
+    suite_paths = sorted(suite_root.glob("*/suite.json"), reverse=True)
+    if not suite_paths:
+        return pd.DataFrame(), {"reason": "尚无多策略回测结果", "strategies": []}
+    suite_path = suite_paths[0]
+    suite = json.loads(suite_path.read_text(encoding="utf-8"))
+    spec_by_id = {spec.strategy_id: spec for spec in STRATEGIES}
+    ranked = sorted(
+        (
+            item for item in suite.get("strategies", [])
+            if item.get("strategy_id") in spec_by_id
+        ),
+        key=lambda item: float(item["metrics"]["cumulative_return"]),
+        reverse=True,
+    )[:top_n]
+    if not ranked:
+        return pd.DataFrame(), {"reason": "回测结果中没有可用于当日信号的策略", "strategies": []}
+
+    signal_config = {
+        **config,
+        "strategy": {**config["strategy"], "top_k": CACHE_TOP_K},
+    }
+    top50, calculation = selection_for_date(signal_config, selected_date)
+    stats, coverage = recommendation_history_stats(config, selected_date)
+    rows: list[dict[str, Any]] = []
+    for item in ranked:
+        spec = spec_by_id[item["strategy_id"]]
+        rank_limit = spec.fallback_entry_rank or spec.entry_rank
+        candidates: list[pd.Series] = []
+        for _, stock in top50.sort_values("rank").iterrows():
+            code = str(stock["ts_code"])
+            rank = int(stock["rank"])
+            if rank > rank_limit:
+                continue
+            streak = 1
+            if spec.consecutive_rank is not None:
+                streak = int(stats.get(code, {}).get(f"consecutive_top{spec.consecutive_rank}", 0))
+            if streak >= spec.consecutive_days:
+                candidates.append(stock)
+        if spec.fallback_entry_rank is not None:
+            candidates = candidates[:1]
+        for stock in candidates:
+            code = str(stock["ts_code"])
+            rows.append({
+                "ts_code": code,
+                "name": str(stock.get("name", code)),
+                "rank": int(stock["rank"]),
+                "total_score": float(stock["total_score"]),
+                "consecutive_top20": int(stats.get(code, {}).get("consecutive_top20", 0)),
+                "consecutive_top50": int(stats.get(code, {}).get("consecutive_top50", 0)),
+                "strategy_id": spec.strategy_id,
+                "strategy_name": spec.name,
+                "strategy_return": float(item["metrics"]["cumulative_return"]),
+            })
+    strategy_meta = [{
+        "strategy_id": item["strategy_id"],
+        "name": item["name"],
+        "cumulative_return": float(item["metrics"]["cumulative_return"]),
+    } for item in ranked]
+    if not rows:
+        return pd.DataFrame(), {
+            "reason": "最佳五策略在所选日期均没有满足入场条件的标的",
+            "strategies": strategy_meta, "suite": suite_path.parent.name,
+            "coverage": coverage, "calculation": calculation,
+        }
+    detail = pd.DataFrame(rows)
+    recommendations = detail.groupby(["ts_code", "name"], as_index=False).agg(
+        rank=("rank", "min"),
+        total_score=("total_score", "max"),
+        consecutive_top20=("consecutive_top20", "max"),
+        consecutive_top50=("consecutive_top50", "max"),
+        strategy_support_count=("strategy_id", "nunique"),
+        supporting_strategies=("strategy_name", lambda values: "；".join(dict.fromkeys(values))),
+        best_supporting_return=("strategy_return", "max"),
+        mean_supporting_return=("strategy_return", "mean"),
+    )
+    recommendations = recommendations.sort_values(
+        ["strategy_support_count", "rank", "total_score"],
+        ascending=[False, True, False], kind="stable",
+    ).reset_index(drop=True)
+    recommendations.insert(0, "joint_rank", recommendations.index + 1)
+    return recommendations, {
+        "reason": "", "strategies": strategy_meta, "suite": suite_path.parent.name,
+        "coverage": coverage, "calculation": calculation,
+    }
 def warm_recommendation_cache(
     config: dict[str, Any], start_date: date = RECOMMENDATION_HISTORY_START,
     end_date: date | None = None,

@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -5,7 +6,7 @@ import pandas as pd
 import yaml
 
 from jkquant.config import load_config
-from jkquant.pipeline import run_daily, selection_for_date
+from jkquant.pipeline import best_strategy_recommendations, run_daily, selection_for_date
 
 
 def test_demo_pipeline_creates_top_k_csv(tmp_path: Path) -> None:
@@ -38,3 +39,45 @@ def test_top_k_is_limited_to_fifty(tmp_path: Path, section: str) -> None:
     path.write_text(yaml.safe_dump(source, allow_unicode=True), encoding="utf-8")
     with pytest.raises(ValueError, match="1 到 50"):
         load_config(path)
+
+
+def test_best_strategy_recommendations_aggregate_entry_signals(tmp_path: Path, monkeypatch) -> None:
+    suite_dir = tmp_path / "backtests" / "strategy_suite" / "2025-09-01_2026-09-09"
+    suite_dir.mkdir(parents=True)
+    strategy_ids = [
+        "s05_top20_streak3_confirm2", "s04_top50_streak2_confirm2",
+        "s05_top20_streak3", "s04_top50_streak2", "s02_top5_exit20_confirm2",
+    ]
+    suite = {
+        "strategies": [
+            {"strategy_id": strategy_id, "name": strategy_id,
+             "metrics": {"cumulative_return": 0.5 - index * 0.1}}
+            for index, strategy_id in enumerate(strategy_ids)
+        ]
+    }
+    (suite_dir / "suite.json").write_text(
+        __import__("json").dumps(suite, ensure_ascii=False), encoding="utf-8",
+    )
+    frame = pd.DataFrame({
+        "ts_code": ["000001.SZ", "000002.SZ", "000003.SZ"],
+        "name": ["甲", "乙", "丙"], "rank": [1, 2, 3],
+        "total_score": [0.9, 0.8, 0.7],
+    })
+    stats = {
+        "000001.SZ": {"consecutive_top20": 3, "consecutive_top50": 3},
+        "000002.SZ": {"consecutive_top20": 3, "consecutive_top50": 3},
+        "000003.SZ": {"consecutive_top20": 2, "consecutive_top50": 2},
+    }
+    monkeypatch.setattr("jkquant.pipeline.selection_for_date", lambda *_: (frame, {"cached": True}))
+    monkeypatch.setattr(
+        "jkquant.pipeline.recommendation_history_stats",
+        lambda *_: (stats, {"cached_days": 3, "expected_days": 3}),
+    )
+    config = {
+        "_config_dir": str(tmp_path), "strategy_suite": {"output_dir": "backtests/strategy_suite"},
+        "strategy": {"top_k": 20},
+    }
+    result, metadata = best_strategy_recommendations(config, date(2026, 9, 9))
+    assert len(metadata["strategies"]) == 5
+    assert result.iloc[0]["strategy_support_count"] == 5
+    assert result.loc[result["ts_code"].eq("000003.SZ"), "strategy_support_count"].iloc[0] == 3
