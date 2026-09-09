@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from dotenv import load_dotenv
 
 from .backtest.engine import run_backtest as execute_backtest
 from .backtest.reporting import write_backtest_report
 from .config import resolve_path
 from .data.akshare_provider import AkshareMetadataProvider
+from .data.selection_cache import SelectionCache, strategy_key
 from .data.demo_provider import DemoProvider
 from .data.storage import ParquetStore
 from .data.tushare_provider import TushareProvider
@@ -73,8 +76,49 @@ def run_daily(config: dict[str, Any], end_date: date | None = None) -> tuple[Pat
     if selection.empty:
         raise RuntimeError("过滤后没有足够数据生成选股结果，请检查配置和数据完整性")
     path = write_csv(selection, resolve_path(config, config["report"]["output_dir"]))
+    SelectionCache(store.root / "selection_results.sqlite3").put(
+        strategy_key(config), factors["trade_date"].max().date(), selection
+    )
     LOGGER.info("报告已生成: %s", path)
     return path, summary
+
+
+def available_selection_dates(config: dict[str, Any]) -> list[date]:
+    daily = build_store(config).load_daily()
+    if daily.empty:
+        return []
+    earliest = daily["trade_date"].min() + pd.Timedelta(days=120)
+    values = sorted(daily.loc[daily["trade_date"].ge(earliest), "trade_date"].unique())
+    return [pd.Timestamp(value).date() for value in values]
+
+
+def selection_for_date(
+    config: dict[str, Any], selected_date: date
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load a cached historical Top-K or calculate it from a bounded window."""
+    started = time.perf_counter()
+    store = build_store(config)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    key = strategy_key(config)
+    cached = cache.get(key, selected_date)
+    if cached is not None:
+        return cached, {"cached": True, "elapsed_seconds": time.perf_counter() - started}
+    daily = store.load_daily()
+    target = pd.Timestamp(selected_date)
+    if not daily["trade_date"].eq(target).any():
+        raise ValueError(f"{selected_date} 不是本地缓存中的交易日")
+    window = daily[daily["trade_date"].between(target - pd.Timedelta(days=200), target)]
+    factors = calculate_factors(window)
+    latest_date = daily["trade_date"].max().date()
+    selection, summary = select_stocks(
+        factors, store.load_basic(), config,
+        use_current_metadata=selected_date == latest_date,
+    )
+    if selection.empty:
+        raise RuntimeError(f"{selected_date} 没有足够数据生成候选")
+    cache.put(key, selected_date, selection)
+    summary.update({"cached": False, "elapsed_seconds": time.perf_counter() - started})
+    return selection, summary
 
 
 def run_historical_backtest(

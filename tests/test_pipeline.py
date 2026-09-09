@@ -17,4 +17,5 @@ def test_demo_pipeline_creates_top_k_csv(tmp_path: Path) -> None:
     report, summary = run_daily(load_config(path))
     assert report.exists()
     assert len(report.read_text(encoding="utf-8-sig").splitlines()) == 11
+    assert "amount_100m" in report.read_text(encoding="utf-8-sig").splitlines()[0]
     assert summary["universe_count"] == 100
