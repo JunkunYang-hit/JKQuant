@@ -24,7 +24,7 @@ market:
   min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
 
 strategy:
-  top_k: 20
+  top_k: 20  # 默认推荐数量，可设 1-50；运行时可用 --top-k 临时覆盖
   factors:
     return_5d: {category: momentum, direction: 1, weight: 0.35}
     return_20d: {category: momentum, direction: 1, weight: 0.65}
@@ -46,7 +46,7 @@ report:
 backtest:
   start_date: "2025-01-01"
   end_date: null  # null 表示截至本地最新交易日
-  top_k: 20
+  top_k: 20  # 回测持仓数量，可设 1-50；与每日推荐数量相互独立
   rebalance_days: 5
   initial_cash: 1000000
   benchmark: universe_equal_weight

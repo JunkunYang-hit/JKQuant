@@ -44,6 +44,7 @@ JKQuant/
 ├── scripts/
 │   ├── update_data.py          # 只更新本地行情缓存
 │   ├── run_daily.py            # 更新数据并生成当天 Top-K
+│   ├── run_today.py            # 每日入口：更新、选股并自动打开 WebUI
 │   ├── run_backtest.py         # 更新所需历史数据并执行回测
 │   └── run_webui.py            # 启动本地 WebUI 并自动打开浏览器
 ├── tests/                      # 因子无未来数据、完整流程和回测测试
@@ -80,6 +81,20 @@ python scripts/run_daily.py
 ```
 
 程序会自动读取项目根目录的 `.env`。该文件已被 `.gitignore` 排除，不会被 Git 提交。也仍然支持只在当前 PowerShell 会话中设置 `$env:TUSHARE_TOKEN = "你的 token"`。
+
+日常使用推荐直接运行下面这一条，它会依次拉取截至今天的最新数据、生成当日推荐，然后启动 WebUI 并自动打开浏览器：
+
+```powershell
+python scripts/run_today.py --top-k 20
+```
+
+`--top-k` 可设为 1 到 50；不填写时使用 `config.yaml` 中的 `strategy.top_k`。例如生成 Top-50：
+
+```powershell
+python scripts/run_today.py --top-k 50
+```
+
+WebUI 里也可以重新选择 K，推荐表每页最多显示 10 只。更改 K 后首次计算可能需要数秒，之后同一日期、同一 K 会直接命中 SQLite 缓存。
 
 也可以仅更新数据：
 
@@ -153,6 +168,8 @@ python scripts/run_backtest.py --start 2025-01-01 --end 2025-12-31
 - `equity_drawdown.png`：策略与全市场等权基准净值、策略回撤
 
 信号在 T 日收盘后形成，最早于 T+1 开盘交易。调仓日将旧持仓隔夜收益和新持仓开盘至收盘收益分开计算，避免用 T+1 的价格选择 T 日股票。非调仓日使用收盘到收盘收益。当前基准是当日可交易股票的等权收益。
+
+当前回测并非在测试一个未定义的 AI 模型，而是在测试本项目已经写入配置和代码的固定规则：用动量 40%、趋势 25%、低风险 20%、流动性 15% 合成得分，选择前 `backtest.top_k` 只股票，只做多、等权持有，并每 `rebalance_days` 个交易日调仓。回测中的“收益”是按这些历史持仓的真实历史价格变化模拟出的组合盈亏；净收益还会扣除佣金、印花税和滑点。它回答的是“过去机械执行这套规则会怎样”，不代表未来能获得相同收益。
 
 ## 本地 WebUI
 

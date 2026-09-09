@@ -23,12 +23,16 @@ def _validate(config: dict[str, Any]) -> None:
     weights = config["strategy"]["category_weights"]
     if abs(sum(float(v) for v in weights.values()) - 1.0) > 1e-9:
         raise ValueError("strategy.category_weights 权重之和必须为 1")
-    if int(config["strategy"]["top_k"]) <= 0:
-        raise ValueError("strategy.top_k 必须大于 0")
+    strategy_top_k = int(config["strategy"]["top_k"])
+    if not 1 <= strategy_top_k <= 50:
+        raise ValueError("strategy.top_k 必须在 1 到 50 之间")
     if "backtest" in config:
         backtest = config["backtest"]
-        if int(backtest["top_k"]) <= 0 or int(backtest["rebalance_days"]) <= 0:
-            raise ValueError("backtest.top_k 和 rebalance_days 必须大于 0")
+        backtest_top_k = int(backtest["top_k"])
+        if not 1 <= backtest_top_k <= 50:
+            raise ValueError("backtest.top_k 必须在 1 到 50 之间")
+        if int(backtest["rebalance_days"]) <= 0:
+            raise ValueError("backtest.rebalance_days 必须大于 0")
         if float(backtest["initial_cash"]) <= 0:
             raise ValueError("backtest.initial_cash 必须大于 0")
         costs = backtest["cost"]

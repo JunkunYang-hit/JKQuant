@@ -12,6 +12,13 @@ def _date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def _top_k(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 50:
+        raise argparse.ArgumentTypeError("Top-K 必须在 1 到 50 之间")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="A股日频多因子选股系统")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
@@ -22,6 +29,7 @@ def main() -> None:
     daily = subparsers.add_parser("daily", help="更新数据并输出 Top-K")
     daily.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     daily.add_argument("--end", type=_date)
+    daily.add_argument("--top-k", type=_top_k, help="临时覆盖推荐数量（1-50）")
     backtest = subparsers.add_parser("backtest", help="执行历史 Top-K 回测")
     backtest.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     backtest.add_argument("--start", type=_date)
@@ -43,6 +51,8 @@ def main() -> None:
         print(f"回测指标: {paths['metrics']}")
         print(f"净值图: {paths['plot']}")
         return
+    if args.top_k is not None:
+        config["strategy"]["top_k"] = args.top_k
     path, summary = run_daily(config, args.end)
     print(f"数据日期: {summary['trade_date']}")
     print(f"原始股票数: {summary['universe_count']}")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from pathlib import Path
 
 import altair as alt
@@ -78,6 +80,19 @@ def _selection_dates() -> list:
 def render_topk() -> None:
     st.title("每日候选（Top-K）")
     st.caption("120 积分模式：使用 Tushare 日线量价选股，当前证券简称由 AKShare 补充。")
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    configured_top_k = int(config["strategy"]["top_k"])
+    try:
+        default_top_k = int(os.getenv("JKQUANT_TOP_K", configured_top_k))
+    except ValueError:
+        default_top_k = configured_top_k
+    default_top_k = min(max(default_top_k, 1), 50)
+    top_k = int(st.number_input(
+        "推荐股票数量 K", min_value=1, max_value=50,
+        value=default_top_k, step=1,
+        help="修改后会按同一套策略重新取得 Top-K；不同 K 的结果分别缓存。",
+    ))
+    config["strategy"]["top_k"] = top_k
     dates = _selection_dates()
     if not dates:
         st.info("尚无本地历史行情。请先运行：python scripts/update_data.py")
@@ -85,7 +100,7 @@ def render_topk() -> None:
     selected_date = st.selectbox("选择推荐日期", list(reversed(dates)), format_func=str)
     with st.spinner("读取缓存或计算当日候选..."):
         frame, calculation = selection_for_date(
-            load_config(PROJECT_ROOT / "config.yaml"), selected_date
+            config, selected_date
         )
     source = "SQLite 缓存" if calculation["cached"] else "首次计算并写入 SQLite"
     st.caption(f"结果来源：{source}｜耗时：{calculation['elapsed_seconds']:.3f} 秒")
@@ -102,7 +117,21 @@ def render_topk() -> None:
     display["amount_mean_20d"] = display["amount_mean_20d"] / 100_000
     for column in PERCENT_FACTORS:
         display[column] = display[column] * 100
-    st.dataframe(display.rename(columns=TOPK_NAMES), width="stretch", hide_index=True, height=520)
+    page_size = 10
+    page_count = max(1, math.ceil(len(display) / page_size))
+    page_number = 1
+    if page_count > 1:
+        page_number = int(st.number_input(
+            "页码", min_value=1, max_value=page_count, value=1, step=1,
+            help=f"共 {page_count} 页，每页最多 {page_size} 只股票。",
+        ))
+    page_start = (page_number - 1) * page_size
+    page = display.iloc[page_start:page_start + page_size]
+    st.caption(f"第 {page_number}/{page_count} 页｜第 {page_start + 1}–{page_start + len(page)} 名")
+    st.dataframe(
+        page.rename(columns=TOPK_NAMES), width="stretch", hide_index=True,
+        height=min(420, 38 + 35 * len(page)),
+    )
     choices = dict(zip(display["ts_code"], display["name"], strict=False))
     code = st.selectbox(
         "查看单只股票的因子得分", display["ts_code"].tolist(),
@@ -154,6 +183,11 @@ def render_topk() -> None:
 
 def render_backtest() -> None:
     st.title("策略回测")
+    st.info(
+        "当前回测测的是一套明确的固定规则：每日按 8 个量价因子打分，选择得分最高的 "
+        "Top-K，只做多并等权持有，每 5 个交易日调仓；信号在 T 日收盘后生成，T+1 执行，"
+        "并扣除配置中的佣金、印花税和滑点。它不是 AI 预测，也不是某只股票的预测涨幅。"
+    )
     with st.expander("指标与专业名词解释", expanded=True):
         st.markdown(
             "- **累计收益**：整个回测区间从起点到终点一共赚或亏多少。\n"
@@ -234,6 +268,12 @@ def render_system_help() -> None:
         "- **低风险 20%**：20日波动和回撤越小得分越高。\n"
         "- **流动性 15%**：平均成交额和近期成交活跃度较高得分更高。\n\n"
         "这是一套固定规则，并不是 AI 预测模型。真实回测目前显著跑输基准，因此 Top-K 只能作为研究清单。"
+    )
+    st.subheader("回测中的‘收益’从哪里来")
+    st.markdown(
+        "回测把历史每个调仓日当作当时正在运行系统：只用该日以前的数据选股，在下一交易日按开盘价模拟换仓，"
+        "之后按持仓股票的实际历史涨跌计算组合每日盈亏。**净收益**是在股票涨跌形成的毛收益上再扣除模拟交易成本；"
+        "逐日复合后得到累计收益和净值。因此它衡量的是‘过去机械执行当前规则会怎样’，不是未来收益承诺。"
     )
     st.subheader("仍需补齐的关键模块")
     st.markdown(
