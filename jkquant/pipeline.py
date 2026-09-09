@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 from .backtest.engine import run_backtest as execute_backtest
 from .backtest.reporting import write_backtest_report
+from .backtest.strategy_suite import (
+    STRATEGIES, run_event_strategy, write_strategy_result, write_suite_index,
+)
 from .config import resolve_path
 from .data.akshare_provider import AkshareMetadataProvider
 from .data.selection_cache import SelectionCache, strategy_key
@@ -242,3 +245,84 @@ def run_historical_backtest(
     paths = write_backtest_report(result, folder)
     LOGGER.info("回测完成: %s", folder)
     return paths, result.metrics
+
+
+def run_strategy_suite(
+    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
+) -> tuple[Path, list[dict[str, Any]]]:
+    settings = config.get("strategy_suite", {})
+    start = start_date or date.fromisoformat(settings.get("start_date", "2025-09-01"))
+    configured_end = settings.get("end_date")
+    requested_end = end_date or (
+        date.fromisoformat(configured_end) if configured_end else date.today()
+    )
+    store = run_update(config, end_date=requested_end, start_date=start - timedelta(days=200))
+    daily = store.load_daily()
+    end = min(requested_end, daily["trade_date"].max().date())
+    if start >= end:
+        raise ValueError("多策略回测开始日期必须早于本地最新交易日")
+    warm_recommendation_cache(config, start, end)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    rankings = cache.history(strategy_key(_top50_config(config)), start, end)
+    expected_dates = {
+        pd.Timestamp(value).date() for value in daily["trade_date"].unique()
+        if start <= pd.Timestamp(value).date() <= end
+    }
+    cached_dates = set(rankings["trade_date"].unique())
+    if cached_dates != expected_dates:
+        missing = sorted(expected_dates - cached_dates)
+        raise RuntimeError(f"Top-50 信号缓存不完整，缺少 {len(missing)} 个交易日")
+    basic = store.load_basic()
+    names = (
+        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
+        .set_index("ts_code")["name"].astype(str).to_dict()
+        if "name" in basic else {}
+    )
+    costs = config["backtest"]["cost"]
+    initial_cash = float(config["backtest"]["initial_cash"])
+    take_profit = float(settings.get("take_profit", 0.30))
+    record_profit = float(settings.get("record_profit", 0.20))
+    root = resolve_path(
+        config, settings.get("output_dir", "backtests/strategy_suite")
+    ) / f"{start}_{end}"
+    summaries: list[dict[str, Any]] = []
+    baseline = execute_backtest(daily, basic, config, start, end)
+    baseline.metrics.update({
+        "strategy_id": "baseline_top10_3d",
+        "strategy_name": "基准：Top10线性权重，每3日调仓",
+        "strategy_description": "固定持有Top10并按排名线性分配权重，每3个交易日重新选股调仓。",
+        "threshold_enabled": False, "profit_take_30_count": 0,
+        "crossed_20_count": 0, "completed_trades": int(len(baseline.trades)),
+        "open_positions": int(baseline.daily["holdings"].iloc[-1]),
+        "average_holding_days": 0.0, "profitable_trade_rate": 0.0,
+    })
+    baseline_folder = root / "baseline_top10_3d"
+    write_strategy_result(
+        baseline_folder, baseline.daily, baseline.trades, pd.DataFrame(), baseline.metrics,
+    )
+    summaries.append({
+        "strategy_id": "baseline_top10_3d", "name": baseline.metrics["strategy_name"],
+        "description": baseline.metrics["strategy_description"],
+        "folder": "baseline_top10_3d", "metrics": baseline.metrics,
+    })
+    LOGGER.info(
+        "基准回测完成: %s | 累计收益 %.2f%%",
+        baseline.metrics["strategy_name"], baseline.metrics["cumulative_return"] * 100,
+    )
+    for spec in STRATEGIES:
+        result, trades, events, metrics = run_event_strategy(
+            daily, rankings, names, spec, start, end, initial_cash, costs,
+            take_profit=take_profit, record_profit=record_profit,
+        )
+        metrics["threshold_enabled"] = True
+        folder = root / spec.strategy_id
+        write_strategy_result(folder, result, trades, events, metrics)
+        summaries.append({
+            "strategy_id": spec.strategy_id, "name": spec.name,
+            "description": spec.description, "folder": spec.strategy_id,
+            "metrics": metrics,
+        })
+        LOGGER.info("策略回测完成: %s | 累计收益 %.2f%%", spec.name, metrics["cumulative_return"] * 100)
+    index_path = write_suite_index(root, start, end, summaries)
+    LOGGER.info("多策略回测汇总: %s", index_path)
+    return index_path, summaries

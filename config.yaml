@@ -57,3 +57,10 @@ backtest:
     commission_sell: 0.0003
     stamp_tax: 0.0005
     slippage: 0.0005
+
+strategy_suite:
+  start_date: "2025-09-01"
+  end_date: null
+  output_dir: backtests/strategy_suite
+  take_profit: 0.30
+  record_profit: 0.20

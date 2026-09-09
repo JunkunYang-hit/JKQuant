@@ -66,16 +66,53 @@ DAILY_NAMES = {
     "rebalanced": "是否调仓", "equity": "策略净值",
     "equity_value": "账户权益", "benchmark_equity": "基准净值",
     "drawdown": "回撤",
+    "cash": "现金",
 }
 TRADE_NAMES = {
     "trade_date": "交易日期", "signal_date": "信号日期", "holdings": "持仓数量",
     "buy_turnover": "买入换手", "sell_turnover": "卖出换手",
     "cost_rate": "成本率", "codes": "持仓代码", "weights": "持仓权重",
+    "strategy_id": "策略编号", "ts_code": "股票代码", "name": "证券简称",
+    "entry_date": "买入日期", "exit_date": "结束日期",
+    "holding_period": "持股时间区间",
+    "holding_trading_days": "持有交易日", "entry_price": "买入价",
+    "exit_price": "结束价", "price_change": "价格变化", "net_return": "净收益",
+    "exit_reason": "结束原因", "crossed20_date": "首次超过20%日期", "status": "状态",
+}
+EVENT_NAMES = {
+    "strategy_id": "策略编号", "event": "事件", "ts_code": "股票代码",
+    "name": "证券简称", "entry_date": "买入日期", "event_date": "事件日期",
+    "holding_period": "持股时间区间",
+    "holding_trading_days": "已持有交易日", "entry_price": "买入价",
+    "trigger_price": "触发价", "day_high": "当日最高价", "price_change": "最高涨幅",
 }
 
 
 def _percent(value: float) -> str:
     return f"{value:.2%}"
+
+
+def _suite_folders() -> list[Path]:
+    return sorted(
+        {path.parent for path in (BACKTESTS_ROOT / "strategy_suite").glob("*/suite.json")},
+        reverse=True,
+    )
+
+
+def _strategy_result_folders() -> list[Path]:
+    suite = {
+        path.parent for path in (BACKTESTS_ROOT / "strategy_suite").glob("*/*/metrics.json")
+    }
+    legacy = {path.parent for path in BACKTESTS_ROOT.glob("*/metrics.json")}
+    return sorted(suite | legacy, reverse=True)
+
+
+def _result_label(folder: Path) -> str:
+    metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
+    name = metrics.get("strategy_name", folder.name)
+    if folder.parent.parent.name == "strategy_suite":
+        return f"{name}｜{folder.parent.name}"
+    return f"旧版单策略｜{folder.name}"
 
 
 @st.cache_data(ttl=60)
@@ -289,15 +326,55 @@ def render_topk() -> None:
         )
 
 
-def render_backtest() -> None:
-    st.title("策略回测")
-    st.info(
-        "当前回测测的是一套明确的固定规则：每日按 8 个量价因子打分，选择得分最高的 "
-        "Top-10，只做多并按排名线性分配权重（第1名最高、第10名最低），每 3 个交易日调仓；"
-        "信号在 T 日收盘后生成，T+1 执行，"
-        "并扣除配置中的佣金、印花税和滑点。它不是 AI 预测，也不是某只股票的预测涨幅。"
+def render_strategy_overview() -> None:
+    st.title("策略总览")
+    folders = _suite_folders()
+    if not folders:
+        st.info("尚无多策略结果。请运行：python scripts/run_strategy_suite.py")
+        return
+    folder = st.selectbox("回测批次", folders, format_func=lambda value: value.name)
+    suite = json.loads((folder / "suite.json").read_text(encoding="utf-8"))
+    st.caption(
+        f"统一比较区间：{suite['start_date']} 至 {suite['end_date']}｜"
+        f"生成时间：{suite['generated_at']}"
     )
-    with st.expander("指标与专业名词解释", expanded=True):
+    records = []
+    for strategy in suite["strategies"]:
+        metrics = strategy["metrics"]
+        records.append({
+            "策略": strategy["name"], "累计收益": metrics["cumulative_return"],
+            "年化收益": metrics["annualized_return"], "超额收益": metrics["excess_return"],
+            "夏普": metrics["sharpe_ratio"], "最大回撤": metrics["max_drawdown"],
+            "年化波动": metrics["annualized_volatility"], "日胜率": metrics["win_rate"],
+            "已平仓交易": metrics.get("completed_trades", 0),
+            "盈利超20%记录": metrics.get("crossed_20_count", 0),
+            "30%止盈": metrics.get("profit_take_30_count", 0),
+            "平均持有交易日": metrics.get("average_holding_days", 0),
+        })
+    comparison = pd.DataFrame(records).sort_values("累计收益", ascending=False)
+    st.subheader("横向比较")
+    st.dataframe(
+        comparison.style.format({
+            "累计收益": "{:.2%}", "年化收益": "{:.2%}", "超额收益": "{:.2%}",
+            "夏普": "{:.3f}", "最大回撤": "{:.2%}", "年化波动": "{:.2%}",
+            "日胜率": "{:.2%}", "平均持有交易日": "{:.1f}",
+        }),
+        width="stretch", hide_index=True,
+    )
+    st.subheader("累计收益对比")
+    st.bar_chart(comparison.set_index("策略")[["累计收益"]])
+    selected = st.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
+    threshold_note = (
+        "该新增策略记录20%盈利事件，并在达到30%时止盈。"
+        if selected["metrics"].get("threshold_enabled", True)
+        else "该策略是原三日调仓基准，不应用20%/30%阈值规则。"
+    )
+    st.info(selected["description"] + " " + threshold_note)
+    st.caption("进入“策略分析”页面可查看所选策略的净值、回撤、逐日数据、交易区间和阈值事件。")
+
+
+def _render_glossary() -> None:
+    with st.expander("指标与专业名词解释", expanded=False):
         st.markdown(
             "- **累计收益**：整个回测区间从起点到终点一共赚或亏多少。\n"
             "- **年化收益**：把累计收益折算成每年复利增长率；越高越好，但必须与基准和回撤一起看。\n"
@@ -310,19 +387,28 @@ def render_backtest() -> None:
             "- **卡玛比率**：年化收益÷最大回撤绝对值；越高越好，小于0较差，0～1一般，1以上较好。\n"
             "- **最大回撤**：越接近0越好。10%以内较低，10%～20%中等，30%以上通常属于高回撤。\n"
             "- **年化波动率**：越低越稳定；股票策略可粗略将15%以下视为较低、15%～30%中等、30%以上较高。\n"
-            "- **胜率**：越高通常越好，50%以上代表正收益日更多，但还必须结合盈亏幅度。\n"
+            "- **日胜率**：正收益交易日占比；越高通常越好，但还必须结合每次盈亏幅度。\n"
+            "- **交易胜率**：已平仓交易中净收益为正的比例，与日胜率不是同一指标。\n"
+            "- **20%记录**：持仓期间最高价首次达到买入价上方20%的事件，只记录、不卖出。\n"
+            "- **30%止盈**：日内最高价达到目标时模拟卖出；日线无法还原分钟成交顺序，因此属于近似撮合。\n"
             "- **换手率**：越低越节省成本，但过低也可能反应迟钝；需要结合超额收益判断。以上区间都是研究经验值，不是保证。"
         )
-    folders = sorted(
-        {path.parent for path in BACKTESTS_ROOT.glob("*/metrics.json")}, reverse=True
-    )
+
+
+def render_backtest() -> None:
+    st.title("策略分析")
+    folders = _strategy_result_folders()
     if not folders:
-        st.info("尚无回测结果。请先运行：python scripts/run_backtest.py")
+        st.info("尚无回测结果。请先运行：python scripts/run_strategy_suite.py")
         return
-    folder = st.selectbox("回测区间", folders, format_func=lambda path: path.name)
+    folder = st.selectbox("选择策略回测结果", folders, format_func=_result_label)
     metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
+    st.info(metrics.get("strategy_description", "旧版定期调仓策略结果。"))
     daily = pd.read_csv(folder / "daily.csv", parse_dates=["trade_date", "signal_date"])
-    trades_path = folder / "rebalances.csv"
+    trades_path = folder / "trades.csv"
+    if not trades_path.exists():
+        trades_path = folder / "rebalances.csv"
+    events_path = folder / "threshold_events.csv"
 
     columns = st.columns(4)
     columns[0].metric("累计收益", _percent(metrics["cumulative_return"]))
@@ -338,7 +424,13 @@ def render_backtest() -> None:
     columns[0].metric("索提诺比率", f"{metrics.get('sortino_ratio', 0):.3f}")
     columns[1].metric("信息比率", f"{metrics.get('information_ratio', 0):.3f}")
     columns[2].metric("卡玛比率", f"{metrics.get('calmar_ratio', 0):.3f}")
-    columns[3].metric("调仓次数", int(metrics.get("rebalance_count", 0)))
+    columns[3].metric("交易/调仓次数", int(metrics.get("completed_trades", metrics.get("rebalance_count", 0))))
+    if metrics.get("threshold_enabled", "crossed_20_count" in metrics):
+        columns = st.columns(4)
+        columns[0].metric("盈利超20%记录", int(metrics.get("crossed_20_count", 0)))
+        columns[1].metric("30%止盈次数", int(metrics.get("profit_take_30_count", 0)))
+        columns[2].metric("平均持有交易日", f"{metrics.get('average_holding_days', 0):.1f}")
+        columns[3].metric("交易胜率", _percent(metrics.get("profitable_trade_rate", 0)))
 
     st.subheader("净值曲线")
     equity = daily.set_index("trade_date")[["equity", "benchmark_equity"]]
@@ -353,9 +445,23 @@ def render_backtest() -> None:
     st.subheader("逐日结果")
     st.dataframe(daily.rename(columns=DAILY_NAMES), width="stretch", hide_index=True, height=380)
     if trades_path.exists():
-        st.subheader("调仓记录")
+        st.subheader("交易与持股区间")
         trades = pd.read_csv(trades_path).rename(columns=TRADE_NAMES)
+        for column in ["价格变化", "净收益"]:
+            if column in trades:
+                trades[column] = trades[column].map(lambda value: f"{value:.2%}")
         st.dataframe(trades, width="stretch", hide_index=True)
+    if events_path.exists() and metrics.get("threshold_enabled", True):
+        st.subheader("盈利阈值事件")
+        events = pd.read_csv(events_path).rename(columns=EVENT_NAMES)
+        if events.empty:
+            st.info("该策略没有出现盈利超过20%的持仓事件。")
+        else:
+            if "最高涨幅" in events:
+                events["最高涨幅"] = events["最高涨幅"].map(lambda value: f"{value:.2%}")
+            st.dataframe(events, width="stretch", hide_index=True)
+    st.divider()
+    _render_glossary()
 
 
 def render_system_help() -> None:
@@ -399,14 +505,16 @@ def render_system_help() -> None:
 def main() -> None:
     st.set_page_config(page_title="JKQuant", page_icon="📈", layout="wide")
     st.sidebar.title("JKQuant")
-    page = st.sidebar.radio("页面", ["每日候选", "回测指标", "系统说明"])
+    page = st.sidebar.radio("页面", ["每日候选", "策略总览", "策略分析", "系统说明"])
     st.sidebar.divider()
     st.sidebar.caption("本地只读展示界面，不执行自动交易。")
     if st.sidebar.button("刷新页面"):
         st.rerun()
     if page == "每日候选":
         render_topk()
-    elif page == "回测指标":
+    elif page == "策略总览":
+        render_strategy_overview()
+    elif page == "策略分析":
         render_backtest()
     else:
         render_system_help()

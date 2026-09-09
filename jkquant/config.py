@@ -40,6 +40,12 @@ def _validate(config: dict[str, Any]) -> None:
         costs = backtest["cost"]
         if any(float(value) < 0 for value in costs.values()):
             raise ValueError("回测交易成本不能为负数")
+    if "strategy_suite" in config:
+        suite = config["strategy_suite"]
+        record_profit = float(suite.get("record_profit", 0.20))
+        take_profit = float(suite.get("take_profit", 0.30))
+        if not 0 < record_profit < take_profit:
+            raise ValueError("strategy_suite 必须满足 0 < record_profit < take_profit")
 
 
 def resolve_path(config: dict[str, Any], value: str) -> Path:
