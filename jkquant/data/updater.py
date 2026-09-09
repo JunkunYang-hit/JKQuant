@@ -42,6 +42,9 @@ def update_data(
     start_date: date | None = None,
     basic_refresh_days: int = 7,
     fetch_stock_basic: bool = True,
+    fetch_company_names: bool = False,
+    name_refresh_days: int = 30,
+    metadata_provider: DataProvider | None = None,
 ) -> None:
     if fetch_stock_basic:
         basic_is_fresh = store.basic_path.exists() and (
@@ -69,4 +72,18 @@ def update_data(
 
     if not fetch_stock_basic:
         LOGGER.info("120 积分模式：从日线缓存构造最小证券元数据")
-        store.save_basic(_derive_basic_from_daily(store.load_daily()))
+        basic = _derive_basic_from_daily(store.load_daily())
+        names_are_fresh = store.names_path.exists() and (
+            date.today() - date.fromtimestamp(store.names_path.stat().st_mtime)
+        ).days < name_refresh_days
+        if fetch_company_names and not names_are_fresh:
+            LOGGER.info("通过备用元数据源更新证券中文简称")
+            if metadata_provider is None:
+                raise RuntimeError("已启用证券名称更新，但没有配置元数据源")
+            store.save_names(metadata_provider.company_names())
+        names = store.load_names()
+        if not names.empty:
+            basic = basic.merge(names, on="ts_code", how="left", suffixes=("", "_company"))
+            basic["name"] = basic["name_company"].fillna(basic["name"])
+            basic = basic.drop(columns=["name_company"])
+        store.save_basic(basic)

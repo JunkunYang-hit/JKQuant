@@ -17,3 +17,6 @@ class DataProvider(ABC):
     def stock_basic(self) -> pd.DataFrame:
         """Return ts_code, name, list_date and list_status."""
 
+    def company_names(self) -> pd.DataFrame:
+        """Return optional ts_code/name mapping for low-permission accounts."""
+        return pd.DataFrame(columns=["ts_code", "name"])

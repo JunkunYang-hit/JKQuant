@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from .backtest.engine import run_backtest as execute_backtest
 from .backtest.reporting import write_backtest_report
 from .config import resolve_path
+from .data.akshare_provider import AkshareMetadataProvider
 from .data.demo_provider import DemoProvider
 from .data.storage import ParquetStore
 from .data.tushare_provider import TushareProvider
@@ -46,10 +47,18 @@ def run_update(
     config: dict[str, Any], end_date: date | None = None, start_date: date | None = None
 ) -> ParquetStore:
     store = build_store(config)
+    provider = build_provider(config)
+    is_demo = config["data"]["provider"] == "demo"
+    metadata_provider = None
+    if not is_demo and config["data"].get("name_provider") == "akshare":
+        metadata_provider = AkshareMetadataProvider()
     update_data(
-        build_provider(config), store, end_date or date.today(), int(config["data"]["history_days"]),
+        provider, store, end_date or date.today(), int(config["data"]["history_days"]),
         start_date=start_date, basic_refresh_days=int(config["data"].get("basic_refresh_days", 7)),
-        fetch_stock_basic=bool(config["data"].get("fetch_stock_basic", True)),
+        fetch_stock_basic=is_demo or bool(config["data"].get("fetch_stock_basic", True)),
+        fetch_company_names=(not is_demo) and bool(config["data"].get("fetch_company_names", False)),
+        name_refresh_days=int(config["data"].get("name_refresh_days", 30)),
+        metadata_provider=metadata_provider,
     )
     return store
 
@@ -58,7 +67,9 @@ def run_daily(config: dict[str, Any], end_date: date | None = None) -> tuple[Pat
     store = run_update(config, end_date)
     daily = store.load_daily()
     factors = calculate_factors(daily)
-    selection, summary = select_stocks(factors, store.load_basic(), config)
+    selection, summary = select_stocks(
+        factors, store.load_basic(), config, use_current_metadata=True
+    )
     if selection.empty:
         raise RuntimeError("过滤后没有足够数据生成选股结果，请检查配置和数据完整性")
     path = write_csv(selection, resolve_path(config, config["report"]["output_dir"]))

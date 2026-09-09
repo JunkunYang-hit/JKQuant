@@ -11,6 +11,7 @@ class ParquetStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.daily_path = root / "daily.parquet"
         self.basic_path = root / "stock_basic.parquet"
+        self.names_path = root / "company_names.parquet"
 
     def load_daily(self) -> pd.DataFrame:
         if not self.daily_path.exists():
@@ -34,3 +35,11 @@ class ParquetStore:
     def save_basic(self, frame: pd.DataFrame) -> None:
         frame.to_parquet(self.basic_path, index=False)
 
+    def load_names(self) -> pd.DataFrame:
+        if not self.names_path.exists():
+            return pd.DataFrame(columns=["ts_code", "name"])
+        return pd.read_parquet(self.names_path)
+
+    def save_names(self, frame: pd.DataFrame) -> None:
+        if not frame.empty:
+            frame.to_parquet(self.names_path, index=False)

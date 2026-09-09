@@ -10,6 +10,7 @@ def select_stocks(
     basic: pd.DataFrame,
     config: dict[str, Any],
     top_k: int | None = None,
+    use_current_metadata: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, int | str]]:
     """Filter and rank the latest available cross-section."""
     if factors.empty:
@@ -19,7 +20,7 @@ def select_stocks(
     universe_count = len(latest)
     latest = latest.merge(basic, on="ts_code", how="left")
     market = config["market"]
-    if market.get("exclude_st", True):
+    if market.get("exclude_st", True) and use_current_metadata:
         latest = latest[~latest["name"].fillna("").str.upper().str.contains("ST")]
     if "delist_date" in latest:
         delist_date = pd.to_datetime(latest["delist_date"], errors="coerce")

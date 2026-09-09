@@ -3,6 +3,9 @@ data:
   provider: tushare
   access_tier: 120
   fetch_stock_basic: false  # 120 积分仅使用 daily；不调用高积分元数据接口
+  fetch_company_names: true  # AKShare 补充当前证券简称，不消耗 Tushare 权限
+  name_provider: akshare
+  name_refresh_days: 30
   token_env: TUSHARE_TOKEN
   cache_dir: data/cache
   history_days: 220
@@ -16,7 +19,7 @@ data:
 
 market:
   universe: all_a
-  exclude_st: false  # 120 积分的 daily 不含股票名称，无法可靠识别 ST
+  exclude_st: true  # 每日选股用 AKShare 当前简称过滤；历史回测不套用当前名称
   min_list_days: 120
   min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
 
