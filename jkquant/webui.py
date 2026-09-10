@@ -11,6 +11,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from jkquant.ai import get_cached_analysis, run_ai_analysis
 from jkquant.config import load_config
 from jkquant.data.account_store import AccountStore
 from jkquant.holiday_risk import holiday_risk
@@ -414,6 +415,118 @@ def render_topk() -> None:
             "所有得分范围都是 **0～1，越高越好**。0.80 表示大致超过当日80%的有效股票；"
             "综合得分只表示符合当前规则的程度，不是上涨概率。"
         )
+
+
+def _render_ai_result(result: dict) -> None:
+    analysis = result["analysis"]
+    risk = str(analysis.get("overall_risk_level", "未知"))
+    if risk == "高":
+        st.error(f"整体风险：{risk}")
+    elif risk == "中":
+        st.warning(f"整体风险：{risk}")
+    else:
+        st.success(f"整体风险：{risk}")
+    st.subheader("市场与候选组合摘要")
+    st.write(analysis.get("market_summary", "暂无摘要"))
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**组合观察**")
+        for item in analysis.get("portfolio_observations", []):
+            st.markdown(f"- {item}")
+    with right:
+        st.markdown("**集中度风险**")
+        for item in analysis.get("concentration_risks", []):
+            st.markdown(f"- {item}")
+
+    candidates = analysis.get("candidates", [])
+    if candidates:
+        overview = pd.DataFrame([{
+            "排名": item.get("rank"), "股票代码": item.get("ts_code"),
+            "证券简称": item.get("name"), "AI关注级别": item.get("attention_level"),
+            "摘要": item.get("summary"), "数据完整性": item.get("data_completeness"),
+        } for item in candidates]).sort_values("排名")
+        st.subheader("Top-20 AI复核结果")
+        st.dataframe(overview, width="stretch", hide_index=True, height=520)
+        st.caption("表格保持原始量价排名；AI关注级别不会改写选股分数或触发交易。")
+        st.subheader("逐只分析")
+        for item in sorted(candidates, key=lambda value: int(value.get("rank", 999))):
+            label = (
+                f"#{item.get('rank')} {item.get('ts_code')} {item.get('name')}｜"
+                f"{item.get('attention_level', '未评级')}"
+            )
+            with st.expander(label):
+                st.write(item.get("summary", ""))
+                cols = st.columns(4)
+                sections = (
+                    ("积极因素", "positive_factors"), ("风险因素", "risk_factors"),
+                    ("观察条件", "watch_conditions"), ("判断失效条件", "invalidation_conditions"),
+                )
+                for column, (heading, key) in zip(cols, sections):
+                    column.markdown(f"**{heading}**")
+                    for text_value in item.get(key, []):
+                        column.markdown(f"- {text_value}")
+
+    limitations = analysis.get("data_limitations", [])
+    if limitations:
+        with st.expander("数据边界与局限"):
+            for item in limitations:
+                st.markdown(f"- {item}")
+    st.info(analysis.get("disclaimer", "仅供量化研究参考，不构成投资建议。"))
+    usage = result.get("usage", {})
+    st.caption(
+        f"模型：{result.get('model', '未知')}｜提示词版本：{result.get('prompt_version', '未知')}｜"
+        f"生成时间：{result.get('created_at', '未知')}｜来源：{'本地缓存' if result.get('cached') else 'DeepSeek API'}｜"
+        f"Token：输入 {int(usage.get('prompt_tokens', 0) or 0)} / 输出 {int(usage.get('completion_tokens', 0) or 0)}"
+    )
+    with st.expander("查看本次发送给AI的结构化依据"):
+        st.json(result.get("input", {}), expanded=False)
+
+
+def render_ai_analysis() -> None:
+    st.title("AI分析（DeepSeek）")
+    st.caption(
+        "使用本地Top-20、量价因子、估值、财务、宏观和沪深300ETF数据做二次复核。"
+        "页面不会自动调用API，刷新不会重复产生费用。"
+    )
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    dates = _selection_dates()
+    if not dates:
+        st.info("尚无本地候选数据，请先在“每日候选”更新数据并计算推荐。")
+        return
+    date_col, force_col, action_col, _ = st.columns([1.5, 1.35, 1.5, 4.65])
+    requested_date = date_col.date_input(
+        "分析日期", value=date.today(), min_value=dates[0],
+        max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD", key="ai_analysis_date",
+    )
+    eligible = [value for value in dates if value <= requested_date]
+    selected_date = eligible[-1] if eligible else dates[0]
+    force = force_col.toggle(
+        "忽略缓存重新生成", value=False,
+        help="开启后会再次调用DeepSeek并产生新的Token费用。",
+    )
+    generate = action_col.button("生成AI分析", type="primary", use_container_width=True)
+    if selected_date != requested_date:
+        st.info(f"{requested_date} 不是本地交易日，已切换到 {selected_date}。")
+
+    result = get_cached_analysis(config, selected_date)
+    if generate:
+        with st.spinner("正在整理Top-20和时点数据，并请求DeepSeek分析……"):
+            try:
+                result = run_ai_analysis(config, selected_date, force=force)
+                if result.get("cached"):
+                    st.success("输入数据没有变化，已直接读取本地AI分析缓存。")
+                else:
+                    st.success("DeepSeek分析已完成并持久化到本地SQLite。")
+            except Exception as exc:
+                st.error(f"生成失败：{exc}")
+                return
+    if result is None:
+        st.info(
+            "该日期还没有AI分析。请先在项目根目录 `.env` 中填写 "
+            "`DEEPSEEK_API_KEY=你的密钥`，然后点击“生成AI分析”。"
+        )
+        return
+    _render_ai_result(result)
 
 
 def render_strategy_overview() -> None:
@@ -1098,12 +1211,14 @@ def main() -> None:
     if refresh.button("刷新"):
         st.rerun()
     page = st.radio(
-        "模块", ["每日候选", "交易信号提醒", "账户", "策略总览", "策略分析", "策略试验场", "数据中心", "系统说明"],
+        "模块", ["每日候选", "AI分析", "交易信号提醒", "账户", "策略总览", "策略分析", "策略试验场", "数据中心", "系统说明"],
         horizontal=True, label_visibility="collapsed",
     )
     st.divider()
     if page == "每日候选":
         render_topk()
+    elif page == "AI分析":
+        render_ai_analysis()
     elif page == "交易信号提醒":
         render_signal_alerts()
     elif page == "账户":

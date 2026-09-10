@@ -46,6 +46,17 @@ def _validate(config: dict[str, Any]) -> None:
         take_profit = float(suite.get("take_profit", 0.30))
         if not 0 < record_profit <= take_profit:
             raise ValueError("strategy_suite 必须满足 0 < record_profit <= take_profit")
+    if "ai" in config:
+        ai = config["ai"]
+        if ai.get("provider", "deepseek") != "deepseek":
+            raise ValueError("ai.provider 当前仅支持 deepseek")
+        temperature = float(ai.get("temperature", 0.2))
+        if not 0 <= temperature <= 2:
+            raise ValueError("ai.temperature 必须在 0 到 2 之间")
+        if int(ai.get("max_tokens", 6000)) <= 0:
+            raise ValueError("ai.max_tokens 必须大于 0")
+        if int(ai.get("timeout_seconds", 180)) <= 0:
+            raise ValueError("ai.timeout_seconds 必须大于 0")
 
 
 def resolve_path(config: dict[str, Any], value: str) -> Path:

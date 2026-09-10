@@ -79,3 +79,14 @@ strategy_lab:
   confirmation_days: [1, 2, 3]
   entry_ranks: [20, 25]
   exit_ranks: [10, 15, 20, 25]
+
+ai:
+  provider: deepseek
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  temperature: 0.2
+  max_tokens: 6000
+  timeout_seconds: 180
+  max_retries: 2
+  cache_file: ai_analysis.sqlite3

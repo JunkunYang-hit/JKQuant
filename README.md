@@ -1,6 +1,6 @@
 # JKQuant
 
-一个面向实际选股工作的 A 股日频多因子 MVP。它在收盘后更新日线数据，计算 8 个可解释的量价因子，过滤不可用股票，做横截面百分位排名并输出 Top-K CSV。当前版本不训练 AI 模型，也不自动交易。
+一个面向实际选股工作的 A 股日频多因子系统。它在收盘后更新市场数据，计算 8 个可解释的量价因子，过滤不可用股票，做横截面百分位排名并输出 Top-K；可选用 DeepSeek 对 Top-20 做结构化二次复核。系统不训练自己的 AI 模型，也不自动交易。
 
 ## 已实现
 
@@ -22,7 +22,8 @@ JKQuant/
 ├── config.yaml                 # 唯一的运行参数入口：数据、过滤、因子、回测、成本
 ├── environment.yml            # Conda 环境定义
 ├── pyproject.toml              # Python 包、依赖和 jkquant 命令定义
-├── .env                        # 本机 Tushare Token；被 Git 忽略，不会提交
+├── .env                        # 本机 Tushare/DeepSeek 密钥；被 Git 忽略，不会提交
+├── .env.example                # 环境变量模板，不包含真实密钥
 ├── jkquant/                    # 核心 Python 包
 │   ├── cli.py                  # update / daily / backtest 命令解析及终端输出
 │   ├── config.py               # YAML 加载、路径解析、权重和参数校验
@@ -31,6 +32,11 @@ JKQuant/
 │   ├── strategy.py             # 股票过滤、横截面排名、分类得分和 Top-K
 │   ├── report.py               # 每日选股 CSV 输出
 │   ├── webui.py                # Top-K 和回测结果的本地 Streamlit 页面
+│   ├── ai/
+│   │   ├── prompts.py          # Top-20复核提示词、JSON输出结构和版本号
+│   │   ├── deepseek.py         # DeepSeek HTTP客户端、JSON模式、重试和校验
+│   │   ├── service.py          # 组装时点数据、调用模型并核对候选身份
+│   │   └── cache.py            # AI结果和输入依据的SQLite持久化缓存
 │   ├── data/
 │   │   ├── provider.py         # 所有数据源必须实现的统一接口
 │   │   ├── tushare_provider.py # Tushare 调用、限速、重试、字段标准化
@@ -57,6 +63,7 @@ JKQuant/
 │   ├── run_strategy_suite.py   # 执行当前策略组合，并扫描保留策略的止盈阈值
 │   ├── run_strategy_lab.py     # 运行最佳策略的多参数消融试验，支持断点续跑
 │   ├── run_signal_ensemble.py  # 将八策略按等资金子账户回测最近若干月
+│   ├── run_ai_analysis.py      # 命令行生成/读取指定日期的DeepSeek分析
 │   └── run_webui.py            # 启动本地 WebUI 并自动打开浏览器
 ├── tests/                      # 因子无未来数据、完整流程和回测测试
 ├── data/cache/<provider>/      # 本地数据缓存；demo/tushare 隔离且不提交
@@ -298,3 +305,25 @@ python scripts/run_signal_ensemble.py --months 3
 7. **生产运行**：交易日调度、失败通知、数据完整性告警、日志归档、缓存备份和每日结果对比。
 
 当前多数策略仍显著跑输基准；即使阶段收益为正的策略也有很高回撤和波动。优先级最高的是第 1、2 项，而不是直接用于真实买入。
+
+## DeepSeek AI 分析
+
+AI 模块只复核系统已经算出的当日 Top-20，不替代量价排名，也不会自动下单。它会把以下本地信息整理成结构化输入：8 个量价因子、连续上榜记录、换手率、量比、PE/PB/PS、股息率、市值、按公告日截断的财务三表、低频宏观摘要，以及沪深300ETF最近约20个交易日的表现。历史日期不会读取其后公告的财务数据。
+
+先在项目根目录的 `.env` 中新增一行（不要写入 `config.yaml` 或提交到 Git）：
+
+```dotenv
+DEEPSEEK_API_KEY=你的真实DeepSeek密钥
+```
+
+启动 WebUI 后选择顶部“AI分析”，选择日期并点击“生成AI分析”。页面加载或浏览器刷新不会自动请求 API；同一日期、同一模型、同一提示词版本且输入数据未变化时直接读取 `data/cache/tushare/ai_analysis.sqlite3`。只有打开“忽略缓存重新生成”才会主动重复调用并产生新的 Token 用量。
+
+也可以使用命令行：
+
+```powershell
+python scripts/run_ai_analysis.py
+python scripts/run_ai_analysis.py --date 2026-09-10
+python scripts/run_ai_analysis.py --date 2026-09-10 --force
+```
+
+模型、超时、最大输出 Token 和重试次数在 `config.yaml` 的 `ai` 节点配置；当前默认使用 `deepseek-v4-flash`。正式提示词位于 `jkquant/ai/prompts.py`，强制模型只依据输入数据、标明缺失信息、逐只给出积极因素/风险因素/观察条件/失效条件，并返回可校验的 JSON。当前没有接入新闻、公告正文、研报、舆情或盘中数据，因此 AI 不得声称分析了这些内容。
