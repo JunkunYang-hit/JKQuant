@@ -109,6 +109,50 @@ def _percent(value: float) -> str:
     return f"{value:.2%}"
 
 
+def _stock_search(
+    label: str, options: list[str], names: dict[str, str], spellings: dict[str, str], key: str,
+) -> str:
+    """Search stocks by code, fuzzy Chinese name, or Tushare pinyin initials."""
+    search_col, select_col, _ = st.columns([1.5, 2.4, 4.1])
+    query = search_col.text_input(
+        f"搜索{label}", key=f"{key}_query", placeholder="代码/简称/拼音首字母",
+    ).strip().lower()
+    filtered = options
+    if query:
+        filtered = [
+            code for code in options
+            if query in code.lower()
+            or query in str(names.get(code, "")).lower()
+            or query in str(spellings.get(code, "")).lower()
+        ]
+    if not filtered:
+        search_col.warning("没有匹配股票")
+        filtered = options[:1]
+    return select_col.selectbox(
+        label, filtered, key=f"{key}_select",
+        format_func=lambda code: f"{code}｜{names.get(code, '')}",
+    )
+
+
+def _integerize_counts(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    for column in result.columns:
+        label = str(column)
+        if "次数" in label or label in {"交易次数", "记录数", "持仓数量"}:
+            result[column] = pd.to_numeric(result[column], errors="coerce").round().astype("Int64")
+    return result
+
+
+def _basic_search_maps(config: dict) -> tuple[dict[str, str], dict[str, str]]:
+    basic = build_store(config).load_basic().drop_duplicates("ts_code")
+    names = basic.set_index("ts_code")["name"].fillna("").astype(str).to_dict()
+    spellings = (
+        basic.set_index("ts_code")["cnspell"].fillna("").astype(str).to_dict()
+        if "cnspell" in basic else {}
+    )
+    return names, spellings
+
+
 def _suite_folders() -> list[Path]:
     return sorted(
         {path.parent for path in (BACKTESTS_ROOT / "strategy_suite").glob("*/suite.json")},
@@ -152,9 +196,14 @@ def _recommendation_table(
         stock_stats = streaks.get(code, {})
         streak = int(stock_stats.get("consecutive_top20", 0))
         name = html.escape(str(row.get("name", code)))
-        if streak >= 2:
+        if streak >= 3:
             name_html = (
-                f'<span class="streak-name" title="连续 {streak} 个交易日进入 Top-20">'
+                f'<span class="streak-name streak-purple" title="连续 {streak} 个交易日进入 Top-20">'
+                f"{name}</span>"
+            )
+        elif streak == 2:
+            name_html = (
+                f'<span class="streak-name streak-red" title="连续 {streak} 个交易日进入 Top-20">'
                 f"{name}</span>"
             )
         else:
@@ -179,7 +228,9 @@ def _recommendation_table(
       .topk-table th {{background:#f6f8fa; color:#374151}}
       .topk-table th:nth-child(2),.topk-table th:nth-child(3),
       .topk-table td:nth-child(2),.topk-table td:nth-child(3) {{text-align:left}}
-      .streak-name {{color:#e02020; font-weight:700; cursor:help}}
+      .streak-name {{font-weight:700; cursor:help}}
+      .streak-red {{color:#e02020}}
+      .streak-purple {{color:#7e22ce}}
     </style>
     <div class="topk-wrap"><table class="topk-table"><thead><tr>{headers}</tr></thead>
     <tbody>{''.join(rows)}</tbody></table></div>
@@ -200,7 +251,7 @@ def render_topk() -> None:
     except ValueError:
         default_top_k = configured_top_k
     default_top_k = min(max(default_top_k, 1), 50)
-    filter_left, filter_right = st.columns(2)
+    filter_left, filter_right, _ = st.columns([1.1, 1.5, 5.4])
     top_k = int(filter_left.number_input(
         "推荐股票数量 K", min_value=1, max_value=50, value=default_top_k, step=1,
         help="数据库统一缓存 Top-50，修改 K 只截取前 K。",
@@ -251,7 +302,7 @@ def render_topk() -> None:
         "momentum_score", "trend_score", "risk_score", "liquidity_score",
         "close", "amount",
     ]
-    sort_first, sort_second = st.columns([2, 1])
+    sort_first, sort_second, _ = st.columns([1.6, 1.0, 5.4])
     sort_column = sort_first.selectbox(
         "排序字段", sort_options, format_func=lambda value: TOPK_NAMES.get(value, value),
     )
@@ -288,13 +339,13 @@ def render_topk() -> None:
         st.session_state["topk_page"] = page_number + 1
         st.rerun()
     st.caption(
-        f"统计从 {RECOMMENDATION_HISTORY_START} 开始。红色简称表示连续至少 2 个交易日进入 Top-20；"
-        "连续天数和累计进入 Top-50 次数已直接列为字段，也可悬停红色名称查看。"
+        f"统计从 {RECOMMENDATION_HISTORY_START} 开始。连续 2 个交易日进入 Top-20 标红，连续 3 个及以上标紫；"
+        "连续天数和累计进入 Top-50 次数已直接列为字段，也可悬停名称查看。"
     )
-    choices = dict(zip(display["ts_code"], display["name"], strict=False))
-    code = st.selectbox(
-        "查看单只股票的因子得分", display["ts_code"].tolist(),
-        format_func=lambda value: f"{value}｜{choices.get(value, value)}",
+    names, spellings = _basic_search_maps(config)
+    code = _stock_search(
+        "查看单只股票的因子得分", display["ts_code"].tolist(), names, spellings,
+        "topk_factor_stock",
     )
     row = frame.loc[frame["ts_code"].astype(str).eq(code)].iloc[0]
     chart = pd.DataFrame(
@@ -349,7 +400,8 @@ def render_strategy_overview() -> None:
     if not folders:
         st.info("尚无多策略结果。请运行：python scripts/run_strategy_suite.py")
         return
-    folder = st.selectbox("回测批次", folders, format_func=lambda value: value.name)
+    control, _ = st.columns([2.2, 5.8])
+    folder = control.selectbox("回测批次", folders, format_func=lambda value: value.name)
     suite = json.loads((folder / "suite.json").read_text(encoding="utf-8"))
     st.caption(
         f"统一比较区间：{suite['start_date']} 至 {suite['end_date']}｜"
@@ -377,7 +429,7 @@ def render_strategy_overview() -> None:
             "涨停未买入": metrics.get("limit_up_buy_blocked_count", 0),
             "跌停未卖出": metrics.get("limit_down_sell_blocked_count", 0),
         })
-    comparison = pd.DataFrame(records).sort_values("累计收益", ascending=False)
+    comparison = _integerize_counts(pd.DataFrame(records)).sort_values("累计收益", ascending=False)
     st.subheader("横向比较")
     st.dataframe(
         comparison.style.format({
@@ -450,7 +502,8 @@ def render_strategy_overview() -> None:
             "- **成交量已经纳入**：当前流动性类别权重为 15%，包括 20 日平均成交额和 5/20 日成交额比；"
             "它目前是流动性/活跃度评分，不是放量突破确认，后者应另做独立变量测试。"
         )
-    selected = st.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
+    control, _ = st.columns([3, 5])
+    selected = control.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
     threshold = selected["metrics"].get("take_profit_threshold")
     threshold_note = (
         f"该策略在盈利达到{threshold:.0%}时记录完整事件并止盈。"
@@ -485,7 +538,8 @@ def render_backtest() -> None:
     if not folders:
         st.info("尚无回测结果。请先运行：python scripts/run_strategy_suite.py")
         return
-    folder = st.selectbox("选择策略回测结果", folders, format_func=_result_label)
+    control, _ = st.columns([3, 5])
+    folder = control.selectbox("选择策略回测结果", folders, format_func=_result_label)
     metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
     st.info(metrics.get("strategy_description", "旧版定期调仓策略结果。"))
     trades_path = folder / "trades.csv"
@@ -585,7 +639,8 @@ def render_strategy_lab() -> None:
     if not folders:
         st.info("尚无试验结果。请运行：python scripts/run_strategy_lab.py")
         return
-    folder = st.selectbox("试验批次", folders, format_func=lambda value: value.name)
+    control, _ = st.columns([2.2, 5.8])
+    folder = control.selectbox("试验批次", folders, format_func=lambda value: value.name)
     progress = json.loads((folder / "progress.json").read_text(encoding="utf-8"))
     completed = int(progress.get("completed", 0))
     total = int(progress.get("total", 0))
@@ -613,7 +668,7 @@ def render_strategy_lab() -> None:
         return
     results = pd.read_csv(results_path).sort_values("cumulative_return", ascending=False).head(20).copy()
     results.insert(0, "排名", range(1, len(results) + 1))
-    display = results.rename(columns={
+    display = _integerize_counts(results.rename(columns={
         "strategy_name": "试验规则", "entry_rank": "连续入选范围", "exit_rank": "跌出范围",
         "confirmation_days": "卖出确认次数", "take_profit": "止盈阈值",
         "cumulative_return": "累计收益", "annualized_return": "年化收益",
@@ -623,7 +678,7 @@ def render_strategy_lab() -> None:
         "profitable_trade_rate": "交易胜率", "average_holding_days": "平均持有交易日",
         "take_profit_count": "止盈次数", "open_positions": "期末持仓",
         "runtime_seconds": "计算耗时（秒）",
-    })
+    }))
     columns_to_show = [
         "排名", "试验规则", "连续入选范围", "跌出范围", "卖出确认次数", "止盈阈值",
         "累计收益", "年化收益", "超额收益", "最大回撤", "年化波动",
@@ -668,12 +723,12 @@ def render_signal_alerts() -> None:
         st.warning(ensemble_metrics.get("selection_bias_warning", "该复测不是严格样本外检验。"))
         components_path = ensemble_folder / "components.csv"
         if components_path.exists():
-            components = pd.read_csv(components_path).rename(columns={
+            components = _integerize_counts(pd.read_csv(components_path).rename(columns={
                 "source": "来源", "name": "策略", "historical_return": "完整区间收益",
                 "recent_cumulative_return": "最近三个月收益",
                 "recent_max_drawdown": "近期最大回撤",
                 "recent_trade_count": "近期交易次数", "recent_trade_win_rate": "近期交易胜率",
-            })
+            }))
             with st.expander("查看八个子策略近期表现"):
                 st.dataframe(
                     components[["来源", "策略", "完整区间收益", "最近三个月收益", "近期最大回撤", "近期交易次数", "近期交易胜率"]]
@@ -695,7 +750,8 @@ def render_signal_alerts() -> None:
     if not dates:
         st.info("尚无本地历史行情。请先运行：python scripts/run_today.py")
         return
-    requested_date = st.date_input(
+    date_col, _ = st.columns([1.7, 6.3])
+    requested_date = date_col.date_input(
         "选择信号日期", value=date.today(), min_value=dates[0],
         max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD",
     )
@@ -722,18 +778,32 @@ def render_signal_alerts() -> None:
     if joint.empty:
         st.warning(metadata.get("reason", "所选日期没有联合推荐。"))
         return
+    history_stats, _ = recommendation_history_stats(config, selected_date)
+    joint["consecutive_top20"] = joint["ts_code"].map(
+        lambda code: history_stats.get(code, {}).get("consecutive_top20", 0)
+    )
     st.subheader("八策略联合推荐")
     joint_display = joint.rename(columns={
         "joint_rank": "联合排序", "ts_code": "股票代码", "name": "证券简称",
         "rank": "当日总排名", "total_score": "综合得分", "close": "收盘价",
         "consecutive_entry_days": "连续满足天数", "strategy_support_count": "策略支持数",
+        "consecutive_top20": "连续Top-20（天）",
         "supporting_strategies": "支持策略", "best_supporting_return": "支持策略最佳历史收益",
     })
-    st.dataframe(
-        joint_display.style.format({
+    joint_display = _integerize_counts(joint_display)
+    joint_style = joint_display.style.format({
             "综合得分": "{:.3f}", "收盘价": "{:.2f}", "支持策略最佳历史收益": "{:.2%}",
-        }), width="stretch", hide_index=True, height=430,
-    )
+        }).apply(
+            lambda row: [
+                (
+                    "color:#7e22ce;font-weight:700" if row["连续Top-20（天）"] >= 3
+                    else "color:#e02020;font-weight:700" if row["连续Top-20（天）"] == 2
+                    else ""
+                ) if column == "证券简称" else ""
+                for column in row.index
+            ], axis=1,
+        )
+    st.dataframe(joint_style, width="stretch", hide_index=True, height=430)
     st.caption(
         "联合排序依次考虑策略支持数、当日总排名和综合得分。多套策略共享相近的入场逻辑，"
         "支持数不是独立模型投票，也不是上涨概率。"
@@ -750,9 +820,14 @@ def render_signal_alerts() -> None:
             choices.setdefault(row["ts_code"], f"{row['ts_code']}｜{row['name']}｜账户持仓监控")
     selectable_codes = list(joint["ts_code"])
     selectable_codes.extend(code for code in choices if code not in selectable_codes)
-    selected_code = st.selectbox(
-        "选择联合推荐或账户持仓", selectable_codes,
-        format_func=lambda value: choices[value],
+    basic_names, spellings = _basic_search_maps(config)
+    search_names = {
+        code: choices[code].split("｜", 1)[1] if "｜" in choices[code] else basic_names.get(code, "")
+        for code in selectable_codes
+    }
+    selected_code = _stock_search(
+        "选择联合推荐或账户持仓", selectable_codes, search_names, spellings,
+        "signal_stock",
     )
     selected_rows = joint[joint["ts_code"].eq(selected_code)]
     store = build_store(config)
@@ -816,8 +891,11 @@ def render_signal_alerts() -> None:
         "rank_exit_met": "排名退出已触发", "signal": "当前信号",
     })
     st.subheader("逐策略信号明细")
+    detail = _integerize_counts(detail)
     detail_style = detail.style.format({
         "历史累计收益": "{:.2%}", "止盈比例": "{:.0%}", "止盈价": "{:.2f}",
+        "当前排名": "{:.0f}", "连续入选次数": "{:.0f}",
+        "跌出范围": "{:.0f}", "所需退出确认": "{:.0f}", "当前连续跌出次数": "{:.0f}",
     })
     if held:
         liquidation_signals = {"止盈", "策略退出", "价格止损预警"}
@@ -871,13 +949,16 @@ def render_account() -> None:
     basic = store.load_basic()
     basic = basic[basic["list_status"].eq("L")].drop_duplicates("ts_code")
     labels = dict(zip(basic["ts_code"], basic["name"], strict=False))
+    spellings = (
+        dict(zip(basic["ts_code"], basic["cnspell"].fillna(""), strict=False))
+        if "cnspell" in basic else {}
+    )
+    st.subheader("新增或修改持仓")
+    code = _stock_search(
+        "股票", basic["ts_code"].tolist(), labels, spellings, "account_stock",
+    )
     with st.form("holding_form"):
-        st.subheader("新增或修改持仓")
-        code = st.selectbox(
-            "股票", basic["ts_code"].tolist(),
-            format_func=lambda value: f"{value}｜{labels.get(value, '')}",
-        )
-        left, middle, right = st.columns(3)
+        left, middle, right, _ = st.columns([1.2, 1.2, 1.5, 4.1])
         quantity = left.number_input("持仓数量（股）", min_value=1.0, value=100.0, step=100.0)
         cost_price = middle.number_input("持仓成本价（元）", min_value=0.001, value=10.0, step=0.01)
         entry_date = right.date_input("买入日期", value=date.today())
@@ -886,9 +967,10 @@ def render_account() -> None:
             account.upsert(code, labels.get(code, ""), quantity, cost_price, entry_date, notes)
             st.rerun()
     if not holdings.empty:
-        remove_code = st.selectbox(
-            "清仓并移除", holdings["ts_code"].tolist(),
-            format_func=lambda value: f"{value}｜{holdings.set_index('ts_code').at[value, 'name']}",
+        holding_names = holdings.set_index("ts_code")["name"].to_dict()
+        remove_code = _stock_search(
+            "清仓并移除", holdings["ts_code"].tolist(), holding_names, spellings,
+            "remove_holding",
         )
         if st.button("确认移除该持仓"):
             account.delete(remove_code)
@@ -936,9 +1018,12 @@ def render_data_center() -> None:
     available = sorted({path.stem.replace("_", ".") for path in store.fundamental_dir.glob("*/*.parquet")})
     if available:
         names = basic.drop_duplicates("ts_code").set_index("ts_code")["name"].to_dict()
-        code = st.selectbox(
-            "查看单只股票财务报表", available,
-            format_func=lambda value: f"{value}｜{names.get(value, '')}",
+        spellings = (
+            basic.drop_duplicates("ts_code").set_index("ts_code")["cnspell"].fillna("").to_dict()
+            if "cnspell" in basic else {}
+        )
+        code = _stock_search(
+            "查看单只股票财务报表", available, names, spellings, "financial_stock",
         )
         for statement, label in (("income", "利润表"), ("balancesheet", "资产负债表"), ("cashflow", "现金流量表")):
             with st.expander(label):
