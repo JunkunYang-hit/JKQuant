@@ -87,6 +87,7 @@ def run_experiments(
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "elapsed_seconds": (datetime.now() - started_at).total_seconds(), "error": error,
             "results_file": results_path.name,
+            "cost_model": costs,
         }
         _write_progress(progress_path, payload)
         if progress_callback:

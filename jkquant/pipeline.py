@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -317,7 +318,11 @@ def combined_signal_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
     lab_root = resolve_path(
         config, config.get("strategy_lab", {}).get("output_dir", "backtests/strategy_lab")
     )
-    lab_paths = sorted(lab_root.glob("*/results.csv"), reverse=True)
+    lab_paths = []
+    for candidate in sorted(lab_root.glob("*/results.csv"), reverse=True):
+        progress_path = candidate.parent / "progress.json"
+        if not progress_path.exists() or json.loads(progress_path.read_text(encoding="utf-8")).get("status") == "completed":
+            lab_paths.append(candidate)
     if lab_paths:
         lab = pd.read_csv(lab_paths[0]).sort_values("cumulative_return", ascending=False).head(5)
         for _, row in lab.iterrows():
@@ -873,9 +878,12 @@ def run_strategy_lab(
         st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
         daily = daily[~daily["ts_code"].isin(st_codes)].copy()
         rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
+    cost_key = hashlib.sha256(
+        json.dumps(config["backtest"]["cost"], sort_keys=True).encode("utf-8")
+    ).hexdigest()[:8]
     output = resolve_path(
         config, settings.get("output_dir", "backtests/strategy_lab")
-    ) / f"{start}_{end}"
+    ) / f"{start}_{end}_cost-{cost_key}"
     return run_experiments(
         daily, rankings, names, start, end,
         float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],
