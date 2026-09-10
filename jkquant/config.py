@@ -59,6 +59,13 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError("ai.max_tokens 必须大于 0")
         if int(ai.get("timeout_seconds", 180)) <= 0:
             raise ValueError("ai.timeout_seconds 必须大于 0")
+    if "factor_diagnostics" in config:
+        diagnostics = config["factor_diagnostics"]
+        horizons = [int(value) for value in diagnostics.get("horizons", [])]
+        if not horizons or any(value <= 0 for value in horizons):
+            raise ValueError("factor_diagnostics.horizons 必须是正整数列表")
+        if int(diagnostics.get("quantiles", 5)) < 2:
+            raise ValueError("factor_diagnostics.quantiles 必须至少为 2")
 
 
 def resolve_path(config: dict[str, Any], value: str) -> Path:

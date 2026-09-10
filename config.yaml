@@ -91,3 +91,10 @@ ai:
   timeout_seconds: 180
   max_retries: 2
   cache_file: ai_analysis.sqlite3
+
+factor_diagnostics:
+  start_date: null  # null表示使用最近lookback_days个交易日
+  lookback_days: 252
+  horizons: [1, 5, 20]
+  quantiles: 5
+  output_dir: backtests/factor_diagnostics
