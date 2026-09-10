@@ -13,9 +13,10 @@ import streamlit as st
 
 from jkquant.config import load_config
 from jkquant.data.account_store import AccountStore
+from jkquant.holiday_risk import holiday_risk
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
-    build_store,
+    build_store, run_daily,
     combined_signal_recommendations, recommendation_history_stats, selection_for_date,
     stock_signal_reminders,
 )
@@ -239,8 +240,29 @@ def _recommendation_table(
 
 def render_topk() -> None:
     st.title("每日候选（Top-K）")
+    show_holiday_hint = st.toggle("显示节假日前风险提示", value=True)
+    if show_holiday_hint:
+        holiday_status = holiday_risk(date.today())
+        if holiday_status and holiday_status["level"] == "warning":
+            st.warning(
+                f"节前风险提示：距离{holiday_status['holiday_name']}假期还有 "
+                f"{holiday_status['days_ahead']} 天。长假前资金可能趋于谨慎，可重点检查仓位和流动性；"
+                "这只是风险提醒，系统不会自动清仓。"
+            )
+        elif holiday_status and holiday_status["level"] == "safe":
+            st.success("安全提示：未来两天内没有中国法定节假日开始。")
     st.caption("2000 积分数据模式：证券简称来自 Tushare 股票列表，推荐仍以已验证的量价因子为主。")
     config = load_config(PROJECT_ROOT / "config.yaml")
+    action_col, _ = st.columns([1.8, 6.2])
+    if action_col.button("更新数据并计算今日推荐", type="primary", use_container_width=True):
+        with st.spinner("正在更新最新数据、计算 Top-50 并同步信号缓存……"):
+            try:
+                report_path, _ = run_daily(config, date.today())
+                latest_date = build_store(config).load_daily()["trade_date"].max().date()
+                combined_signal_recommendations(config, latest_date)
+                st.success(f"已完成 {latest_date} 推荐并同步到其他模块：{report_path.name}")
+            except Exception as exc:
+                st.error(f"今日推荐计算失败：{exc}")
     dates = _selection_dates()
     if not dates:
         st.info("尚无本地历史行情。请先运行：python scripts/update_data.py")
