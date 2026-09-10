@@ -169,8 +169,13 @@ def get_cached_analysis(config: dict[str, Any], selected_date: date) -> dict[str
     return _cache(config).latest(selected_date)
 
 
+def test_ai_connection(config: dict[str, Any]) -> dict[str, Any]:
+    load_dotenv(resolve_path(config, ".env"), override=True)
+    return DeepSeekClient(config.get("ai", {})).test_connection()
+
+
 def run_ai_analysis(config: dict[str, Any], selected_date: date, force: bool = False) -> dict[str, Any]:
-    load_dotenv(resolve_path(config, ".env"))
+    load_dotenv(resolve_path(config, ".env"), override=True)
     settings = config.get("ai", {})
     provider = str(settings.get("provider", "deepseek"))
     if provider != "deepseek":
@@ -189,7 +194,7 @@ def run_ai_analysis(config: dict[str, Any], selected_date: date, force: bool = F
     client = DeepSeekClient(settings)
     analysis, usage = client.complete(
         SYSTEM_PROMPT, user_prompt(context), float(settings.get("temperature", 0.2)),
-        int(settings.get("max_tokens", 6000)),
+        int(settings.get("max_tokens", 16000)),
     )
     expected = [(int(item["rank"]), str(item["ts_code"]), str(item.get("name", "")))
                 for item in context["candidates"]]

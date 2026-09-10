@@ -50,10 +50,12 @@ def _validate(config: dict[str, Any]) -> None:
         ai = config["ai"]
         if ai.get("provider", "deepseek") != "deepseek":
             raise ValueError("ai.provider 当前仅支持 deepseek")
+        if ai.get("thinking", "disabled") not in {"enabled", "disabled"}:
+            raise ValueError("ai.thinking 仅支持 enabled 或 disabled")
         temperature = float(ai.get("temperature", 0.2))
         if not 0 <= temperature <= 2:
             raise ValueError("ai.temperature 必须在 0 到 2 之间")
-        if int(ai.get("max_tokens", 6000)) <= 0:
+        if int(ai.get("max_tokens", 16000)) <= 0:
             raise ValueError("ai.max_tokens 必须大于 0")
         if int(ai.get("timeout_seconds", 180)) <= 0:
             raise ValueError("ai.timeout_seconds 必须大于 0")

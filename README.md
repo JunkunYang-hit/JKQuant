@@ -322,8 +322,9 @@ DEEPSEEK_API_KEY=你的真实DeepSeek密钥
 
 ```powershell
 python scripts/run_ai_analysis.py
+python scripts/run_ai_analysis.py --check
 python scripts/run_ai_analysis.py --date 2026-09-10
 python scripts/run_ai_analysis.py --date 2026-09-10 --force
 ```
 
-模型、超时、最大输出 Token 和重试次数在 `config.yaml` 的 `ai` 节点配置；当前默认使用 `deepseek-v4-flash`。正式提示词位于 `jkquant/ai/prompts.py`，强制模型只依据输入数据、标明缺失信息、逐只给出积极因素/风险因素/观察条件/失效条件，并返回可校验的 JSON。当前没有接入新闻、公告正文、研报、舆情或盘中数据，因此 AI 不得声称分析了这些内容。
+模型、超时、最大输出 Token 和重试次数在 `config.yaml` 的 `ai` 节点配置；当前默认使用 `deepseek-v4-flash`。结构化复核显式设置 `thinking: disabled`，避免思考过程占满输出额度后没有最终 JSON。正式提示词位于 `jkquant/ai/prompts.py`，强制模型只依据输入数据、标明缺失信息、逐只给出积极因素/风险因素/观察条件/失效条件，并返回可校验的 JSON。当前没有接入新闻、公告正文、研报、舆情或盘中数据，因此 AI 不得声称分析了这些内容。

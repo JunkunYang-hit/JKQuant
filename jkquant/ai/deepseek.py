@@ -21,11 +21,31 @@ class DeepSeekClient:
             )
         self.base_url = str(config.get("base_url", "https://api.deepseek.com")).rstrip("/")
         self.model = str(config.get("model", "deepseek-v4-flash"))
+        self.thinking = str(config.get("thinking", "disabled"))
+        if self.thinking not in {"enabled", "disabled"}:
+            raise DeepSeekError("ai.thinking 仅支持 enabled 或 disabled")
         self.timeout = int(config.get("timeout_seconds", 180))
         self.max_retries = int(config.get("max_retries", 2))
 
+    def test_connection(self) -> dict[str, Any]:
+        """Validate authentication without generating tokens."""
+        try:
+            response = requests.get(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"}, timeout=min(self.timeout, 30),
+            )
+        except requests.RequestException as exc:
+            raise DeepSeekError(f"无法连接DeepSeek：{exc}") from exc
+        if not response.ok:
+            raise DeepSeekError(
+                f"DeepSeek连接测试失败（HTTP {response.status_code}）：{response.text[:300]}"
+            )
+        payload = response.json()
+        models = [str(item.get("id")) for item in payload.get("data", []) if item.get("id")]
+        return {"connected": True, "models": models, "configured_model": self.model}
+
     def complete(self, system_prompt: str, user_prompt: str,
-                 temperature: float = 0.2, max_tokens: int = 6000) -> tuple[dict[str, Any], dict[str, Any]]:
+                 temperature: float = 0.2, max_tokens: int = 16000) -> tuple[dict[str, Any], dict[str, Any]]:
         body = {
             "model": self.model,
             "messages": [
@@ -33,6 +53,7 @@ class DeepSeekClient:
                 {"role": "user", "content": user_prompt},
             ],
             "response_format": {"type": "json_object"},
+            "thinking": {"type": self.thinking},
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
@@ -51,16 +72,33 @@ class DeepSeekClient:
                     detail = response.text[:300]
                     raise DeepSeekError(f"DeepSeek 请求失败（HTTP {response.status_code}）：{detail}")
                 payload = response.json()
-                content = payload["choices"][0]["message"]["content"]
+                choice = payload["choices"][0]
+                content = choice["message"]["content"]
                 if not content or not content.strip():
-                    raise DeepSeekError("DeepSeek 返回了空内容")
-                analysis = json.loads(content)
+                    usage = payload.get("usage", {})
+                    raise DeepSeekError(
+                        "DeepSeek 返回空内容"
+                        f"（finish_reason={choice.get('finish_reason', 'unknown')}，"
+                        f"completion_tokens={usage.get('completion_tokens', 0)}）"
+                    )
+                try:
+                    analysis = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    finish_reason = choice.get("finish_reason", "unknown")
+                    raise DeepSeekError(
+                        "DeepSeek返回的JSON不完整"
+                        f"（finish_reason={finish_reason}，completion_tokens="
+                        f"{payload.get('usage', {}).get('completion_tokens', 0)}）：{exc}"
+                    ) from exc
                 self._validate(analysis)
                 return analysis, payload.get("usage", {})
             except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError, DeepSeekError) as exc:
                 last_error = exc
                 if attempt >= self.max_retries or (
-                    isinstance(exc, DeepSeekError) and "HTTP 4" in str(exc) and "HTTP 429" not in str(exc)
+                    isinstance(exc, DeepSeekError) and (
+                        ("HTTP 4" in str(exc) and "HTTP 429" not in str(exc))
+                        or "JSON不完整" in str(exc)
+                    )
                 ):
                     break
                 time.sleep(min(2 ** attempt, 4))

@@ -85,8 +85,9 @@ ai:
   api_key_env: DEEPSEEK_API_KEY
   base_url: https://api.deepseek.com
   model: deepseek-v4-flash
+  thinking: disabled  # Top-20结构化复核关闭思考模式，避免推理占满输出额度
   temperature: 0.2
-  max_tokens: 6000
+  max_tokens: 16000  # 需要容纳20只股票的完整结构化JSON
   timeout_seconds: 180
   max_retries: 2
   cache_file: ai_analysis.sqlite3

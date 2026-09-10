@@ -11,7 +11,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from jkquant.ai import get_cached_analysis, run_ai_analysis
+from jkquant.ai import get_cached_analysis, run_ai_analysis, test_ai_connection
 from jkquant.config import load_config
 from jkquant.data.account_store import AccountStore
 from jkquant.holiday_risk import holiday_risk
@@ -493,7 +493,7 @@ def render_ai_analysis() -> None:
     if not dates:
         st.info("尚无本地候选数据，请先在“每日候选”更新数据并计算推荐。")
         return
-    date_col, force_col, action_col, _ = st.columns([1.5, 1.35, 1.5, 4.65])
+    date_col, force_col, check_col, action_col, _ = st.columns([1.5, 1.35, 1.1, 1.5, 3.55])
     requested_date = date_col.date_input(
         "分析日期", value=date.today(), min_value=dates[0],
         max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD", key="ai_analysis_date",
@@ -504,6 +504,12 @@ def render_ai_analysis() -> None:
         "忽略缓存重新生成", value=False,
         help="开启后会再次调用DeepSeek并产生新的Token费用。",
     )
+    if check_col.button("测试连接", use_container_width=True):
+        try:
+            status = test_ai_connection(config)
+            st.success(f"连接正常。账户可见模型：{', '.join(status['models']) or '未返回列表'}")
+        except Exception as exc:
+            st.error(f"连接失败：{exc}")
     generate = action_col.button("生成AI分析", type="primary", use_container_width=True)
     if selected_date != requested_date:
         st.info(f"{requested_date} 不是本地交易日，已切换到 {selected_date}。")

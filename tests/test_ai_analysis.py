@@ -65,4 +65,21 @@ def test_deepseek_client_uses_json_mode(monkeypatch) -> None:
     assert result["analysis_date"] == "2026-09-10"
     assert usage["total_tokens"] == 9
     assert captured["json"]["response_format"] == {"type": "json_object"}
+    assert captured["json"]["thinking"] == {"type": "disabled"}
     assert captured["headers"]["Authorization"] == "Bearer not-a-real-key"
+
+
+def test_deepseek_connection_check_does_not_generate_tokens(monkeypatch) -> None:
+    class Response:
+        ok = True
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]}
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "not-a-real-key")
+    monkeypatch.setattr("jkquant.ai.deepseek.requests.get", lambda *args, **kwargs: Response())
+    result = DeepSeekClient({"model": "deepseek-v4-flash"}).test_connection()
+    assert result["connected"] is True
+    assert result["models"] == ["deepseek-flash", "deepseek-v4-pro"]
