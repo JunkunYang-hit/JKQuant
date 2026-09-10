@@ -1,15 +1,17 @@
 data:
   # demo 可直接运行；准备实盘时改为 tushare，并设置环境变量 TUSHARE_TOKEN。
   provider: tushare
-  access_tier: 120
-  fetch_stock_basic: false  # 120 积分仅使用 daily；不调用高积分元数据接口
-  fetch_company_names: true  # AKShare 补充当前证券简称，不消耗 Tushare 权限
+  access_tier: 2000
+  fetch_stock_basic: true
+  fetch_company_names: false  # 证券简称和行业直接使用 Tushare 股票列表
+  fetch_enriched_data: true   # 每日指标、涨跌停、周/月线、宏观与 510300 ETF
   name_provider: akshare
   name_refresh_days: 30
   token_env: TUSHARE_TOKEN
   cache_dir: data/cache
   history_days: 220
-  requests_per_minute: 45  # 120 积分档官方上限 50，保留安全余量
+  requests_per_minute: 180  # 2000 积分档留出流控余量
+  financial_requests_per_minute: 75  # 财务三表按 80 次/分钟档保留余量
   max_retries: 5
   retry_backoff_seconds: 5
   request_timeout_seconds: 15
@@ -19,7 +21,7 @@ data:
 
 market:
   universe: all_a
-  exclude_st: true  # 每日选股用 AKShare 当前简称过滤；历史回测不套用当前名称
+  exclude_st: true  # 使用 Tushare 当前简称过滤；历史时点 ST 仍需专门数据还原
   min_list_days: 120
   min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
 
@@ -50,7 +52,7 @@ backtest:
   weighting: rank_linear  # 排名线性加权：第 1 名权重最高，第 10 名最低
   rebalance_days: 3
   initial_cash: 1000000
-  benchmark: universe_equal_weight
+  benchmark: 510300.SH
   output_dir: backtests
   cost:
     commission_buy: 0.0003

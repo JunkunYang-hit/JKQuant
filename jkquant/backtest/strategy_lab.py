@@ -65,6 +65,8 @@ def run_experiments(
     settings: dict[str, Any],
     output_dir: Path,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    benchmark_daily: pd.DataFrame | None = None,
+    limit_daily: pd.DataFrame | None = None,
 ) -> tuple[Path, pd.DataFrame]:
     """Run/resume the strategy-lab grid and persist compact metrics."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +114,8 @@ def run_experiments(
             _, trades, _, metrics = run_event_strategy(
                 daily, rankings, names, spec, start_date, end_date, initial_cash, costs,
                 take_profit=item["take_profit"], record_profit=item["take_profit"],
+                benchmark_daily=benchmark_daily,
+                limit_daily=limit_daily,
             )
             rows.append({
                 "experiment_id": item_id, "strategy_name": spec.name,

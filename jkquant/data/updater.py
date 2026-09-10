@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
 import pandas as pd
@@ -51,6 +52,12 @@ def update_data(
             date.today() - date.fromtimestamp(store.basic_path.stat().st_mtime)
         ).days < basic_refresh_days
         if basic_is_fresh:
+            cached_basic = store.load_basic()
+            basic_is_fresh = "industry" in cached_basic.columns and not (
+                "metadata_source" in cached_basic.columns
+                and cached_basic["metadata_source"].eq("daily_derived").any()
+            )
+        if basic_is_fresh:
             LOGGER.info("股票基础信息缓存仍在有效期内")
         else:
             LOGGER.info("更新股票基础信息")
@@ -87,3 +94,71 @@ def update_data(
             basic["name"] = basic["name_company"].fillna(basic["name"])
             basic = basic.drop(columns=["name_company"])
         store.save_basic(basic)
+
+
+def update_enriched_data(
+    provider: DataProvider, store: ParquetStore, start_date: date, end_date: date,
+    benchmark_code: str = "510300.SH",
+) -> dict[str, int]:
+    """Incrementally persist the 2000-point low-frequency and macro datasets."""
+    daily = store.load_daily()
+    dates = sorted(
+        value.date() for value in pd.to_datetime(daily["trade_date"].unique())
+        if start_date <= value.date() <= end_date
+    )
+    counts: dict[str, int] = {}
+    for endpoint in ("daily_basic", "stk_limit"):
+        cached = store.load_market_dataset("limit" if endpoint == "stk_limit" else endpoint)
+        cached_dates = set(cached["trade_date"].dt.date) if not cached.empty else set()
+        missing = [value for value in dates if value not in cached_dates]
+        frames = []
+        def fetch(trade_date: date) -> pd.DataFrame:
+            return provider.market_by_trade_date(endpoint, trade_date)  # type: ignore[attr-defined]
+
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix=f"tushare-{endpoint}") as executor:
+            fetched = executor.map(fetch, missing)
+            for index, frame in enumerate(fetched, start=1):
+                if not frame.empty:
+                    frames.append(frame)
+                if index % 20 == 0 or index == len(missing):
+                    LOGGER.info("%s 更新进度: %d/%d", endpoint, index, len(missing))
+        if frames:
+            store.save_market_dataset(
+                "limit" if endpoint == "stk_limit" else endpoint,
+                pd.concat(frames, ignore_index=True),
+            )
+        counts[endpoint] = len(missing)
+
+    period_dates = {
+        "weekly": list(pd.Series(pd.to_datetime(dates)).groupby(
+            pd.Series(pd.to_datetime(dates)).dt.to_period("W-FRI")
+        ).max().dt.date),
+        "monthly": list(pd.Series(pd.to_datetime(dates)).groupby(
+            pd.Series(pd.to_datetime(dates)).dt.to_period("M")
+        ).max().dt.date),
+    }
+    for endpoint, expected_dates in period_dates.items():
+        cached = store.load_market_dataset(endpoint)
+        cached_dates = set(cached["trade_date"].dt.date) if not cached.empty else set()
+        missing = [value for value in expected_dates if value not in cached_dates]
+        frames = []
+        for trade_date in missing:
+            frame = provider.market_by_trade_date(endpoint, trade_date)  # type: ignore[attr-defined]
+            if not frame.empty:
+                frames.append(frame)
+        if frames:
+            store.save_market_dataset(endpoint, pd.concat(frames, ignore_index=True))
+        counts[endpoint] = len(missing)
+
+    benchmark = provider.benchmark_daily(benchmark_code, start_date, end_date)  # type: ignore[attr-defined]
+    store.save_market_dataset("benchmark", benchmark)
+    counts["benchmark"] = len(benchmark)
+    for endpoint in ("cn_gdp", "cn_cpi", "cn_ppi", "cn_m", "cn_pmi", "sf_month"):
+        try:
+            frame = provider.macro_dataset(endpoint)  # type: ignore[attr-defined]
+            store.save_macro(endpoint, frame)
+            counts[endpoint] = len(frame)
+        except Exception as exc:
+            LOGGER.warning("宏观数据 %s 更新失败，保留已有缓存: %s", endpoint, exc)
+            counts[endpoint] = 0
+    return counts

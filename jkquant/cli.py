@@ -46,7 +46,6 @@ def main() -> None:
         print(f"累计收益: {metrics['cumulative_return']:.2%}")
         print(f"基准收益: {metrics['benchmark_return']:.2%}")
         print(f"年化收益: {metrics['annualized_return']:.2%}")
-        print(f"Sharpe: {metrics['sharpe_ratio']:.3f}")
         print(f"最大回撤: {metrics['max_drawdown']:.2%}")
         print(f"回测指标: {paths['metrics']}")
         print(f"净值图: {paths['plot']}")

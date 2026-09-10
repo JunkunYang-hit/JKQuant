@@ -8,6 +8,7 @@ __pycache__/
 data/cache/
 reports/
 backtests/
+logs/
 *.egg-info/
 build/
 dist/

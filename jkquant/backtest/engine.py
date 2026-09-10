@@ -10,6 +10,7 @@ import pandas as pd
 from ..factors import calculate_factors
 from ..strategy import select_stocks
 from .metrics import calculate_metrics
+from .benchmark import benchmark_return_map
 from .trading_rules import is_open_limit_down, is_open_limit_up
 
 
@@ -42,6 +43,8 @@ def run_backtest(
     config: dict[str, Any],
     start_date: date,
     end_date: date,
+    benchmark_daily: pd.DataFrame | None = None,
+    limit_daily: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Run a lagged-signal, configurable-weight, long-only Top-K backtest.
 
@@ -49,6 +52,9 @@ def run_backtest(
     rebalance day, old holdings earn the overnight leg and new holdings earn
     the open-to-close leg. This prevents using T+1 prices in T's selection.
     """
+    if limit_daily is not None and not limit_daily.empty:
+        limits = limit_daily[["trade_date", "ts_code", "up_limit", "down_limit"]].copy()
+        daily = daily.merge(limits, on=["trade_date", "ts_code"], how="left")
     factors = calculate_factors(daily)
     dates = sorted(pd.Timestamp(value) for value in factors["trade_date"].unique())
     dates = [value for value in dates if pd.Timestamp(start_date) <= value <= pd.Timestamp(end_date)]
@@ -63,6 +69,7 @@ def run_backtest(
     holdings: dict[str, float] = {}
     records: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
+    benchmark_returns = benchmark_return_map(benchmark_daily)
 
     all_dates = sorted(pd.Timestamp(value) for value in factors["trade_date"].unique())
     date_position = {value: index for index, value in enumerate(all_dates)}
@@ -73,7 +80,7 @@ def run_backtest(
         signal_date = all_dates[global_index - 1]
         market_today = factors[factors["trade_date"].eq(trade_date)].set_index("ts_code")
         close_return = market_today["close"] / market_today["pre_close"] - 1
-        benchmark_return = float(close_return.replace([np.inf, -np.inf], np.nan).dropna().mean())
+        benchmark_return = float(benchmark_returns.get(trade_date, 0.0))
         turnover = buy = sell = cost_rate = 0.0
         blocked_buys = blocked_sells = 0
         rebalanced = step % rebalance_days == 0
@@ -87,6 +94,7 @@ def run_backtest(
                 if code not in holdings and is_open_limit_up(
                     code, float(market_today.at[code, "open"]),
                     float(market_today.at[code, "pre_close"]),
+                    float(market_today.at[code, "up_limit"]) if "up_limit" in market_today and pd.notna(market_today.at[code, "up_limit"]) else None,
                 ):
                     blocked_buys += 1
                     continue
@@ -98,6 +106,7 @@ def run_backtest(
                 and is_open_limit_down(
                     code, float(market_today.at[code, "open"]),
                     float(market_today.at[code, "pre_close"]),
+                    float(market_today.at[code, "down_limit"]) if "down_limit" in market_today and pd.notna(market_today.at[code, "down_limit"]) else None,
                 )
             }
             blocked_sells = len(locked)

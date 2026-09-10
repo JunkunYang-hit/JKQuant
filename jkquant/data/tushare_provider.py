@@ -73,11 +73,12 @@ class TushareProvider(DataProvider):
             frame = self._call(
                 self.pro.stock_basic,
                 exchange="", list_status=status,
-                fields="ts_code,name,list_date,delist_date,list_status",
+                fields="ts_code,symbol,name,area,industry,market,exchange,fullname,enname,cnspell,list_date,delist_date,list_status",
             )
             frames.append(frame)
         result = pd.concat(frames, ignore_index=True).drop_duplicates("ts_code")
         result["list_date"] = pd.to_datetime(result["list_date"], format="%Y%m%d", errors="coerce")
+        result["delist_date"] = pd.to_datetime(result["delist_date"], format="%Y%m%d", errors="coerce")
         return result
 
     def daily(self, start_date: date, end_date: date) -> pd.DataFrame:
@@ -100,3 +101,44 @@ class TushareProvider(DataProvider):
         result = pd.concat(frames, ignore_index=True)
         result["trade_date"] = pd.to_datetime(result["trade_date"], format="%Y%m%d")
         return result
+
+    @staticmethod
+    def _normalize_dates(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.copy()
+        for column in ("trade_date", "ann_date", "f_ann_date", "end_date", "cal_date"):
+            if column in result:
+                result[column] = pd.to_datetime(result[column], format="%Y%m%d", errors="coerce")
+        return result
+
+    def trade_calendar(self, start_date: date, end_date: date) -> pd.DataFrame:
+        return self._normalize_dates(self._call(
+            self.pro.trade_cal, exchange="SSE", start_date=start_date.strftime("%Y%m%d"),
+            end_date=end_date.strftime("%Y%m%d"), is_open="1",
+        ))
+
+    def market_by_trade_date(self, endpoint: str, trade_date: date) -> pd.DataFrame:
+        function = getattr(self.pro, endpoint)
+        return self._normalize_dates(self._call(function, trade_date=trade_date.strftime("%Y%m%d")))
+
+    def benchmark_daily(self, ts_code: str, start_date: date, end_date: date) -> pd.DataFrame:
+        # fund_daily is the exchange-traded ETF OHLC endpoint. One 10-year range
+        # remains below its row limit for a single ETF.
+        return self._normalize_dates(self._call(
+            self.pro.fund_daily, ts_code=ts_code, start_date=start_date.strftime("%Y%m%d"),
+            end_date=end_date.strftime("%Y%m%d"),
+        ))
+
+    def financial_statement(
+        self, statement: str, ts_code: str, start_date: date, end_date: date,
+    ) -> pd.DataFrame:
+        if statement not in {"income", "balancesheet", "cashflow"}:
+            raise ValueError(f"不支持的财务报表: {statement}")
+        return self._normalize_dates(self._call(
+            getattr(self.pro, statement), ts_code=ts_code,
+            start_date=start_date.strftime("%Y%m%d"), end_date=end_date.strftime("%Y%m%d"),
+        ))
+
+    def macro_dataset(self, endpoint: str) -> pd.DataFrame:
+        if endpoint not in {"cn_gdp", "cn_cpi", "cn_ppi", "cn_m", "cn_pmi", "sf_month"}:
+            raise ValueError(f"不支持的宏观接口: {endpoint}")
+        return self._normalize_dates(self._call(getattr(self.pro, endpoint)))

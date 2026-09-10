@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .metrics import calculate_metrics
+from .benchmark import benchmark_return_map
 from .trading_rules import is_open_limit_down, is_open_limit_up
 
 
@@ -79,8 +80,13 @@ def run_event_strategy(
     daily: pd.DataFrame, rankings: pd.DataFrame, names: dict[str, str], spec: StrategySpec,
     start_date: date, end_date: date, initial_cash: float, costs: dict[str, float],
     take_profit: float | None = 0.20, record_profit: float | None = 0.20,
+    benchmark_daily: pd.DataFrame | None = None,
+    limit_daily: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Run one daily-signal/next-open strategy with opening price constraints."""
+    if limit_daily is not None and not limit_daily.empty:
+        limits = limit_daily[["trade_date", "ts_code", "up_limit", "down_limit"]].copy()
+        daily = daily.merge(limits, on=["trade_date", "ts_code"], how="left")
     if spec.fixed_take_profit is not None:
         take_profit = spec.fixed_take_profit
         record_profit = spec.fixed_take_profit
@@ -94,6 +100,7 @@ def run_event_strategy(
     pending_exit: dict[str, int] = {}
     profit_blocked: set[str] = set()
     daily_records: list[dict[str, Any]] = []
+    benchmark_returns = benchmark_return_map(benchmark_daily)
     trades: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     trade_sequence = 0
@@ -179,7 +186,8 @@ def run_event_strategy(
                 continue
             open_price = float(market.at[code, "open"])
             pre_close = float(market.at[code, "pre_close"])
-            if is_open_limit_down(code, open_price, pre_close):
+            exact_down = float(market.at[code, "down_limit"]) if "down_limit" in market and pd.notna(market.at[code, "down_limit"]) else None
+            if is_open_limit_down(code, open_price, pre_close, exact_down):
                 blocked_sells += 1
                 continue
             gross, fee = sell(code, positions[code], trade_date, open_price, f"连续{spec.exit_confirmation_days}次跌出Top{spec.exit_rank}")
@@ -197,7 +205,8 @@ def run_event_strategy(
             pre_close = float(market.at[code, "pre_close"])
             if open_price <= 0:
                 continue
-            if is_open_limit_up(code, open_price, pre_close):
+            exact_up = float(market.at[code, "up_limit"]) if "up_limit" in market and pd.notna(market.at[code, "up_limit"]) else None
+            if is_open_limit_up(code, open_price, pre_close, exact_up):
                 blocked_buys += 1
                 continue
             candidates.append((code, rank))
@@ -257,8 +266,7 @@ def run_event_strategy(
                 positions[code]["last_price"] = float(market.at[code, "close"])
 
         equity = cash + sum(float(position["shares"] * position["last_price"]) for position in positions.values())
-        close_return = market["close"] / market["pre_close"] - 1
-        benchmark_return = float(close_return.replace([np.inf, -np.inf], np.nan).dropna().mean())
+        benchmark_return = float(benchmark_returns.get(trade_date, 0.0))
         net_return = equity / previous_equity - 1 if previous_equity else 0.0
         gross_return = (equity + transaction_cost) / previous_equity - 1 if previous_equity else 0.0
         daily_records.append({

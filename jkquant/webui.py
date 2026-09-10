@@ -12,8 +12,10 @@ import pandas as pd
 import streamlit as st
 
 from jkquant.config import load_config
+from jkquant.data.account_store import AccountStore
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
+    build_store,
     combined_signal_recommendations, recommendation_history_stats, selection_for_date,
     stock_signal_reminders,
 )
@@ -23,6 +25,11 @@ REPORTS_ROOT = PROJECT_ROOT / "reports"
 BACKTESTS_ROOT = PROJECT_ROOT / "backtests"
 STRATEGY_LAB_ROOT = BACKTESTS_ROOT / "strategy_lab"
 SIGNAL_ENSEMBLE_ROOT = BACKTESTS_ROOT / "signal_ensemble"
+
+
+def _account_store() -> AccountStore:
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    return AccountStore(build_store(config).root / "account.sqlite3")
 
 SCORE_NAMES = {
     "total_score": "综合得分",
@@ -181,7 +188,7 @@ def _recommendation_table(
 
 def render_topk() -> None:
     st.title("每日候选（Top-K）")
-    st.caption("120 积分模式：使用 Tushare 日线量价选股，当前证券简称由 AKShare 补充。")
+    st.caption("2000 积分数据模式：证券简称来自 Tushare 股票列表，推荐仍以已验证的量价因子为主。")
     config = load_config(PROJECT_ROOT / "config.yaml")
     dates = _selection_dates()
     if not dates:
@@ -351,7 +358,7 @@ def render_strategy_overview() -> None:
     st.caption(
         f"成交约束：{suite.get('trading_constraints', '未记录')}；"
         f"ST 过滤：按当前简称近似排除 {suite.get('st_filter', {}).get('excluded_count', 0)} 只。"
-        "当前 120 积分数据无法还原每个历史交易日的 ST 状态。"
+        "历史回测仍使用当前简称近似过滤 ST，后续应接入历史风险警示时点数据。"
     )
     records = []
     for strategy in suite["strategies"]:
@@ -359,7 +366,7 @@ def render_strategy_overview() -> None:
         records.append({
             "策略": strategy["name"], "累计收益": metrics["cumulative_return"],
             "年化收益": metrics["annualized_return"], "超额收益": metrics["excess_return"],
-            "夏普": metrics["sharpe_ratio"], "最大回撤": metrics["max_drawdown"],
+            "最大回撤": metrics["max_drawdown"],
             "年化波动": metrics["annualized_volatility"], "日胜率": metrics["win_rate"],
             "总交易次数": metrics.get("total_trade_count"),
             "盈利次数": metrics.get("profitable_trade_count"),
@@ -375,7 +382,7 @@ def render_strategy_overview() -> None:
     st.dataframe(
         comparison.style.format({
             "累计收益": "{:.2%}", "年化收益": "{:.2%}", "超额收益": "{:.2%}",
-            "夏普": "{:.3f}", "最大回撤": "{:.2%}", "年化波动": "{:.2%}",
+            "最大回撤": "{:.2%}", "年化波动": "{:.2%}",
             "日胜率": "{:.2%}", "平均持有交易日": "{:.1f}",
             "交易胜率": "{:.2%}",
         }, na_rep="—"),
@@ -459,13 +466,8 @@ def _render_glossary() -> None:
         st.markdown(
             "- **累计收益**：整个回测区间从起点到终点一共赚或亏多少。\n"
             "- **年化收益**：把累计收益折算成每年复利增长率；越高越好，但必须与基准和回撤一起看。\n"
-            "- **基准收益**：比较对象的同期收益；策略年化收益高于基准才说明有相对价值。\n"
-            "- **全市场等权（Universe EW）**：当天每只可交易股票权重相同，EW 是 Equal Weight。它不是沪深300。\n"
+            "- **沪深300ETF基准收益**：同期买入并持有 510300.SH 的收益，是独立市场参照，不是你的基准策略。\n"
             "- **超额收益**：策略累计收益减去基准累计收益；大于0较好，小于0表示跑输基准。\n"
-            "- **夏普比率**：越高越好。小于0较差，0～1偏弱，1～2较好，2以上通常优秀；当前无风险利率按0计算。\n"
-            "- **索提诺比率**：只把下跌波动视为风险，越高越好；可粗略参考夏普的区间，但样本越短越不稳定。\n"
-            "- **信息比率**：衡量超额收益相对基准的稳定性；小于0较差，0～0.5一般，0.5～1较好，1以上很强。\n"
-            "- **卡玛比率**：年化收益÷最大回撤绝对值；越高越好，小于0较差，0～1一般，1以上较好。\n"
             "- **最大回撤**：越接近0越好。10%以内较低，10%～20%中等，30%以上通常属于高回撤。\n"
             "- **年化波动率**：越低越稳定；股票策略可粗略将15%以下视为较低、15%～30%中等、30%以上较高。\n"
             "- **日胜率**：正收益交易日占比；越高通常越好，但还必须结合每次盈亏幅度。\n"
@@ -494,17 +496,12 @@ def render_backtest() -> None:
     columns = st.columns(4)
     columns[0].metric("累计收益", _percent(metrics["cumulative_return"]))
     columns[1].metric("年化收益", _percent(metrics["annualized_return"]))
-    columns[2].metric("全市场等权基准收益", _percent(metrics["benchmark_return"]))
+    columns[2].metric("沪深300ETF基准收益", _percent(metrics["benchmark_return"]))
     columns[3].metric("超额收益", _percent(metrics["excess_return"]))
     columns = st.columns(4)
-    columns[0].metric("夏普比率", f"{metrics['sharpe_ratio']:.3f}")
-    columns[1].metric("最大回撤", _percent(metrics["max_drawdown"]))
-    columns[2].metric("年化波动", _percent(metrics["annualized_volatility"]))
-    columns[3].metric("胜率", _percent(metrics["win_rate"]))
-    columns = st.columns(4)
-    columns[0].metric("索提诺比率", f"{metrics.get('sortino_ratio', 0):.3f}")
-    columns[1].metric("信息比率", f"{metrics.get('information_ratio', 0):.3f}")
-    columns[2].metric("卡玛比率", f"{metrics.get('calmar_ratio', 0):.3f}")
+    columns[0].metric("最大回撤", _percent(metrics["max_drawdown"]))
+    columns[1].metric("年化波动", _percent(metrics["annualized_volatility"]))
+    columns[2].metric("胜率", _percent(metrics["win_rate"]))
     columns[3].metric("交易/调仓次数", int(metrics.get("completed_trades", metrics.get("rebalance_count", 0))))
     if metrics.get("threshold_enabled", "crossed_20_count" in metrics):
         columns = st.columns(4)
@@ -533,7 +530,7 @@ def render_backtest() -> None:
         daily = pd.read_csv(folder / "daily.csv", parse_dates=["trade_date", "signal_date"])
         st.subheader("净值曲线")
         equity = daily.set_index("trade_date")[["equity", "benchmark_equity"]]
-        equity.columns = ["策略", "全市场等权基准"]
+        equity.columns = ["策略", "沪深300ETF（510300）"]
         st.line_chart(equity)
         st.subheader("回撤")
         drawdown = daily.set_index("trade_date")[["drawdown"]].rename(columns={"drawdown": "策略回撤"})
@@ -621,7 +618,7 @@ def render_strategy_lab() -> None:
         "confirmation_days": "卖出确认次数", "take_profit": "止盈阈值",
         "cumulative_return": "累计收益", "annualized_return": "年化收益",
         "benchmark_return": "基准收益", "excess_return": "超额收益",
-        "sharpe_ratio": "Sharpe", "max_drawdown": "最大回撤",
+        "max_drawdown": "最大回撤",
         "annualized_volatility": "年化波动", "total_trade_count": "交易次数",
         "profitable_trade_rate": "交易胜率", "average_holding_days": "平均持有交易日",
         "take_profit_count": "止盈次数", "open_positions": "期末持仓",
@@ -629,14 +626,14 @@ def render_strategy_lab() -> None:
     })
     columns_to_show = [
         "排名", "试验规则", "连续入选范围", "跌出范围", "卖出确认次数", "止盈阈值",
-        "累计收益", "年化收益", "超额收益", "Sharpe", "最大回撤", "年化波动",
+        "累计收益", "年化收益", "超额收益", "最大回撤", "年化波动",
         "交易次数", "交易胜率", "平均持有交易日", "止盈次数",
     ]
     st.subheader("当前收益率前二十")
     st.dataframe(
         display[columns_to_show].style.format({
             "止盈阈值": "{:.0%}", "累计收益": "{:.2%}", "年化收益": "{:.2%}",
-            "超额收益": "{:.2%}", "Sharpe": "{:.3f}", "最大回撤": "{:.2%}",
+            "超额收益": "{:.2%}", "最大回撤": "{:.2%}",
             "年化波动": "{:.2%}", "交易胜率": "{:.2%}", "平均持有交易日": "{:.1f}",
         }), width="stretch", hide_index=True, height=760,
     )
@@ -663,27 +660,26 @@ def render_signal_alerts() -> None:
         ensemble_folder = ensemble_folders[0]
         ensemble_metrics = json.loads((ensemble_folder / "metrics.json").read_text(encoding="utf-8"))
         st.subheader("八策略联合近期稳定性复测")
-        recent_cards = st.columns(5)
+        recent_cards = st.columns(4)
         recent_cards[0].metric("最近三个月累计收益", _percent(ensemble_metrics["cumulative_return"]))
         recent_cards[1].metric("同期基准收益", _percent(ensemble_metrics["benchmark_return"]))
         recent_cards[2].metric("超额收益", _percent(ensemble_metrics["excess_return"]))
         recent_cards[3].metric("最大回撤", _percent(ensemble_metrics["max_drawdown"]))
-        recent_cards[4].metric("Sharpe", f"{ensemble_metrics['sharpe_ratio']:.3f}")
         st.warning(ensemble_metrics.get("selection_bias_warning", "该复测不是严格样本外检验。"))
         components_path = ensemble_folder / "components.csv"
         if components_path.exists():
             components = pd.read_csv(components_path).rename(columns={
                 "source": "来源", "name": "策略", "historical_return": "完整区间收益",
                 "recent_cumulative_return": "最近三个月收益",
-                "recent_sharpe_ratio": "近期Sharpe", "recent_max_drawdown": "近期最大回撤",
+                "recent_max_drawdown": "近期最大回撤",
                 "recent_trade_count": "近期交易次数", "recent_trade_win_rate": "近期交易胜率",
             })
             with st.expander("查看八个子策略近期表现"):
                 st.dataframe(
-                    components[["来源", "策略", "完整区间收益", "最近三个月收益", "近期Sharpe", "近期最大回撤", "近期交易次数", "近期交易胜率"]]
+                    components[["来源", "策略", "完整区间收益", "最近三个月收益", "近期最大回撤", "近期交易次数", "近期交易胜率"]]
                     .style.format({
                         "完整区间收益": "{:.2%}", "最近三个月收益": "{:.2%}",
-                        "近期Sharpe": "{:.3f}", "近期最大回撤": "{:.2%}", "近期交易胜率": "{:.2%}",
+                        "近期最大回撤": "{:.2%}", "近期交易胜率": "{:.2%}",
                     }), width="stretch", hide_index=True,
                 )
                 component_chart = alt.Chart(components).mark_bar().encode(
@@ -743,20 +739,40 @@ def render_signal_alerts() -> None:
         "支持数不是独立模型投票，也不是上涨概率。"
     )
 
+    account = _account_store()
+    holdings = account.list_holdings()
     choices = {
         row["ts_code"]: f"{row['ts_code']}｜{row['name']}｜{int(row['strategy_support_count'])}个策略支持"
         for _, row in joint.iterrows()
     }
+    if not holdings.empty:
+        for _, row in holdings.iterrows():
+            choices.setdefault(row["ts_code"], f"{row['ts_code']}｜{row['name']}｜账户持仓监控")
+    selectable_codes = list(joint["ts_code"])
+    selectable_codes.extend(code for code in choices if code not in selectable_codes)
     selected_code = st.selectbox(
-        "选择要检查的联合推荐标的", joint["ts_code"].tolist(),
+        "选择联合推荐或账户持仓", selectable_codes,
         format_func=lambda value: choices[value],
     )
-    selected_stock = joint[joint["ts_code"].eq(selected_code)].iloc[0]
-    held = st.toggle("我已经持有该股票", value=False)
+    selected_rows = joint[joint["ts_code"].eq(selected_code)]
+    store = build_store(config)
+    if selected_rows.empty:
+        market_row = store.load_daily()
+        market_row = market_row[
+            market_row["ts_code"].eq(selected_code) &
+            market_row["trade_date"].dt.date.le(selected_date)
+        ].sort_values("trade_date").iloc[-1]
+        selected_stock = market_row
+    else:
+        selected_stock = selected_rows.iloc[0]
+    holding = account.get(selected_code)
+    held = holding is not None
+    st.info("账户状态：已持有（持仓信息已持久化）" if held else "账户状态：未持有")
     input_left, input_right = st.columns(2)
     entry_price = float(input_left.number_input(
         "实际买入价（元）" if held else "假设买入价（元）",
-        min_value=0.01, value=float(selected_stock["close"]), step=0.01,
+        min_value=0.01,
+        value=float(holding["cost_price"] if held else selected_stock["close"]), step=0.01,
         help="已持有时请填写真实含义上的持仓成本；未持有时默认用当日收盘价估算未来止盈/止损线。",
     ))
     price_stop_loss = float(input_right.number_input(
@@ -820,12 +836,122 @@ def render_signal_alerts() -> None:
     )
 
 
+def render_account() -> None:
+    st.title("账户")
+    st.caption("持仓保存在本机 SQLite；系统只记录和监控，不会连接券商或自动下单。")
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    store = build_store(config)
+    account = _account_store()
+    holdings = account.list_holdings()
+    daily = store.load_daily()
+    latest = (
+        daily.sort_values("trade_date").drop_duplicates("ts_code", keep="last")
+        [["ts_code", "close", "trade_date"]] if not daily.empty else pd.DataFrame()
+    )
+    if not holdings.empty:
+        view = holdings.merge(latest, on="ts_code", how="left")
+        view["market_value"] = view["quantity"] * view["close"]
+        view["cost_value"] = view["quantity"] * view["cost_price"]
+        view["profit"] = view["market_value"] - view["cost_value"]
+        view["profit_rate"] = view["close"] / view["cost_price"] - 1
+        display = view.rename(columns={
+            "ts_code": "股票代码", "name": "证券简称", "quantity": "持仓数量",
+            "cost_price": "成本价", "entry_date": "买入日期", "close": "最新收盘价",
+            "trade_date": "行情日期", "market_value": "市值", "profit": "浮动盈亏",
+            "profit_rate": "浮动收益率", "notes": "备注", "updated_at": "最后修改",
+        })
+        st.dataframe(
+            display[["股票代码", "证券简称", "持仓数量", "成本价", "最新收盘价", "浮动收益率", "市值", "浮动盈亏", "买入日期", "行情日期", "备注"]]
+            .style.format({"成本价": "{:.3f}", "最新收盘价": "{:.3f}", "浮动收益率": "{:.2%}", "市值": "{:,.2f}", "浮动盈亏": "{:,.2f}"}),
+            width="stretch", hide_index=True,
+        )
+    else:
+        st.info("当前没有持仓。请在下面录入第一笔持仓。")
+
+    basic = store.load_basic()
+    basic = basic[basic["list_status"].eq("L")].drop_duplicates("ts_code")
+    labels = dict(zip(basic["ts_code"], basic["name"], strict=False))
+    with st.form("holding_form"):
+        st.subheader("新增或修改持仓")
+        code = st.selectbox(
+            "股票", basic["ts_code"].tolist(),
+            format_func=lambda value: f"{value}｜{labels.get(value, '')}",
+        )
+        left, middle, right = st.columns(3)
+        quantity = left.number_input("持仓数量（股）", min_value=1.0, value=100.0, step=100.0)
+        cost_price = middle.number_input("持仓成本价（元）", min_value=0.001, value=10.0, step=0.01)
+        entry_date = right.date_input("买入日期", value=date.today())
+        notes = st.text_input("备注（可选）")
+        if st.form_submit_button("保存持仓", type="primary"):
+            account.upsert(code, labels.get(code, ""), quantity, cost_price, entry_date, notes)
+            st.rerun()
+    if not holdings.empty:
+        remove_code = st.selectbox(
+            "清仓并移除", holdings["ts_code"].tolist(),
+            format_func=lambda value: f"{value}｜{holdings.set_index('ts_code').at[value, 'name']}",
+        )
+        if st.button("确认移除该持仓"):
+            account.delete(remove_code)
+            st.rerun()
+
+
+def render_data_center() -> None:
+    st.title("数据中心")
+    st.caption("展示本机已经落盘的数据；财务三表与宏观数据暂不直接改变现有量价评分。")
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    store = build_store(config)
+    rows = []
+    for label, name in (
+        ("A股日线", "daily"), ("A股周线", "weekly"), ("A股月线", "monthly"),
+        ("每日估值指标", "daily_basic"), ("每日涨跌停价", "limit"),
+        ("沪深300ETF（510300）", "benchmark"),
+    ):
+        frame = store.load_daily() if name == "daily" else store.load_market_dataset(name)
+        rows.append({
+            "数据集": label, "记录数": len(frame),
+            "最早日期": frame["trade_date"].min().date() if not frame.empty else "—",
+            "最新日期": frame["trade_date"].max().date() if not frame.empty else "—",
+        })
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    macro_rows = []
+    for endpoint, label in (("cn_gdp", "GDP"), ("cn_cpi", "CPI"), ("cn_ppi", "PPI"), ("cn_m", "货币供应"), ("cn_pmi", "PMI"), ("sf_month", "社会融资")):
+        frame = store.load_macro(endpoint)
+        macro_rows.append({"宏观数据": label, "接口": endpoint, "记录数": len(frame)})
+    st.subheader("宏观经济")
+    st.dataframe(pd.DataFrame(macro_rows), width="stretch", hide_index=True)
+    progress_path = store.fundamental_dir / "progress.json"
+    completed_files = {
+        statement: len(list((store.fundamental_dir / statement).glob("*.parquet")))
+        for statement in ("income", "balancesheet", "cashflow")
+    }
+    st.subheader("财务三表")
+    st.write({"利润表股票数": completed_files["income"], "资产负债表股票数": completed_files["balancesheet"], "现金流量表股票数": completed_files["cashflow"]})
+    if progress_path.exists():
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        st.progress(min((progress.get("completed", 0) + progress.get("skipped", 0)) / max(progress.get("total_tasks", 1), 1), 1.0))
+        st.caption(f"状态：{progress.get('status')}｜当前股票：{progress.get('current_stock')}｜失败：{progress.get('failed', 0)}｜更新时间：{progress.get('updated_at')}")
+    else:
+        st.info("尚未启动财务三表补库。运行：python scripts/update_fundamentals.py")
+    basic = store.load_basic()
+    available = sorted({path.stem.replace("_", ".") for path in store.fundamental_dir.glob("*/*.parquet")})
+    if available:
+        names = basic.drop_duplicates("ts_code").set_index("ts_code")["name"].to_dict()
+        code = st.selectbox(
+            "查看单只股票财务报表", available,
+            format_func=lambda value: f"{value}｜{names.get(value, '')}",
+        )
+        for statement, label in (("income", "利润表"), ("balancesheet", "资产负债表"), ("cashflow", "现金流量表")):
+            with st.expander(label):
+                frame = store.load_fundamental(statement, code).sort_values("end_date", ascending=False)
+                st.dataframe(frame.head(12), width="stretch", hide_index=True)
+
+
 def render_system_help() -> None:
     st.title("系统说明")
     st.subheader("系统现在如何运行")
     st.markdown(
-        "1. **更新数据**：按交易日从 Tushare 获取全市场日线，按月写入本地 Parquet。\n"
-        "2. **补充名称**：每 30 天通过 AKShare 更新一次当前 A 股代码和证券简称。\n"
+        "1. **更新数据**：从 Tushare 增量获取股票列表、日/周/月线、每日估值、涨跌停、宏观数据和 510300 ETF，写入本地 Parquet。\n"
+        "2. **更新财务**：利润表、资产负债表和现金流量表按股票断点续传，独立于每日选股任务。\n"
         "3. **计算因子**：每只股票只使用当日及之前的数据计算 8 个量价因子。\n"
         "4. **过滤股票**：排除当前 ST、成交额不足、零成交和历史记录太短的股票。\n"
         "5. **横截面打分**：把当日每个因子转成 0～1 的市场百分位得分。\n"
@@ -850,32 +976,39 @@ def render_system_help() -> None:
     st.markdown(
         "- 因子 IC、分层收益、相关性和稳定性诊断。\n"
         "- 盘中开板排队、停牌延续、100股整数手和最低佣金等更精细的成交约束。\n"
-        "- 历史 ST、退市、名称和指数成分的时点数据。\n"
-        "- 完整复权价格和沪深300/中证500等真实指数基准。\n"
+        "- 更严格的历史 ST、退市、名称和指数成分时点数据。\n"
+        "- 完整复权价格和更多可比较指数基准。\n"
         "- 行业、市值暴露约束，以及自定义/指数股票池。\n"
-        "- 升级数据权限后的估值、质量和成长因子。"
+        "- 对新增估值、质量和成长因子做 IC、分层收益与样本外验证后再纳入评分。"
     )
     st.warning("本系统输出的是量化候选，不构成投资建议，也不会自动下单。")
 
 
 def main() -> None:
     st.set_page_config(page_title="JKQuant", page_icon="📈", layout="wide")
-    st.sidebar.title("JKQuant")
-    page = st.sidebar.radio("页面", ["每日候选", "交易信号提醒", "策略总览", "策略分析", "策略试验场", "系统说明"])
-    st.sidebar.divider()
-    st.sidebar.caption("本地只读展示界面，不执行自动交易。")
-    if st.sidebar.button("刷新页面"):
+    title, refresh = st.columns([9, 1])
+    title.markdown("## JKQuant 选股系统")
+    if refresh.button("刷新"):
         st.rerun()
+    page = st.radio(
+        "模块", ["每日候选", "交易信号提醒", "账户", "策略总览", "策略分析", "策略试验场", "数据中心", "系统说明"],
+        horizontal=True, label_visibility="collapsed",
+    )
+    st.divider()
     if page == "每日候选":
         render_topk()
     elif page == "交易信号提醒":
         render_signal_alerts()
+    elif page == "账户":
+        render_account()
     elif page == "策略总览":
         render_strategy_overview()
     elif page == "策略试验场":
         render_strategy_lab()
     elif page == "策略分析":
         render_backtest()
+    elif page == "数据中心":
+        render_data_center()
     else:
         render_system_help()
 

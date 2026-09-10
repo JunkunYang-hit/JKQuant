@@ -24,7 +24,7 @@ from .data.selection_cache import SelectionCache, strategy_key
 from .data.demo_provider import DemoProvider
 from .data.storage import ParquetStore
 from .data.tushare_provider import TushareProvider
-from .data.updater import update_data
+from .data.updater import update_data, update_enriched_data
 from .factors import calculate_factors
 from .report import write_csv
 from .strategy import select_stocks
@@ -76,6 +76,13 @@ def run_update(
         name_refresh_days=int(config["data"].get("name_refresh_days", 30)),
         metadata_provider=metadata_provider,
     )
+    if not is_demo and bool(config["data"].get("fetch_enriched_data", True)):
+        daily = store.load_daily()
+        if not daily.empty:
+            update_enriched_data(
+                provider, store, daily["trade_date"].min().date(), end_date or date.today(),
+                config.get("backtest", {}).get("benchmark", "510300.SH"),
+            )
     return store
 
 
@@ -518,6 +525,8 @@ def run_recent_signal_ensemble(
     sleeve_cash = initial_cash / len(definitions)
     component_daily: list[pd.DataFrame] = []
     component_summaries: list[dict[str, Any]] = []
+    benchmark = store.load_market_dataset("benchmark")
+    limits = store.load_market_dataset("limit")
     for definition in definitions:
         spec = StrategySpec(
             strategy_id=definition["strategy_id"], name=definition["name"],
@@ -534,6 +543,8 @@ def run_recent_signal_ensemble(
             daily, rankings, names, spec, start, end, sleeve_cash,
             config["backtest"]["cost"], take_profit=float(definition["take_profit"]),
             record_profit=float(definition["take_profit"]),
+            benchmark_daily=benchmark,
+            limit_daily=limits,
         )
         component = result[[
             "trade_date", "equity_value", "benchmark_return", "turnover",
@@ -658,7 +669,10 @@ def run_historical_backtest(
     store = run_update(config, end_date=end, start_date=start - timedelta(days=120))
     daily = store.load_daily()
     daily = daily[daily["trade_date"].dt.date <= end]
-    result = execute_backtest(daily, store.load_basic(), config, start, end)
+    result = execute_backtest(
+        daily, store.load_basic(), config, start, end,
+        store.load_market_dataset("benchmark"), store.load_market_dataset("limit"),
+    )
     folder = resolve_path(config, settings["output_dir"]) / f"{start}_{end}"
     paths = write_backtest_report(result, folder)
     LOGGER.info("回测完成: %s", folder)
@@ -712,7 +726,9 @@ def run_strategy_suite(
         rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
         LOGGER.info("策略回测按当前证券简称近似排除 ST：%d 只", len(st_codes))
     summaries: list[dict[str, Any]] = []
-    baseline = execute_backtest(daily, basic, config, start, end)
+    benchmark = store.load_market_dataset("benchmark")
+    limits = store.load_market_dataset("limit")
+    baseline = execute_backtest(daily, basic, config, start, end, benchmark, limits)
     baseline.metrics.update({
         "strategy_id": "baseline_top10_3d",
         "strategy_name": "基准：Top10线性权重，每3日调仓",
@@ -746,6 +762,8 @@ def run_strategy_suite(
         result, trades, events, metrics = run_event_strategy(
             daily, rankings, names, spec, start, end, initial_cash, costs,
             take_profit=effective_take_profit, record_profit=effective_take_profit,
+            benchmark_daily=benchmark,
+            limit_daily=limits,
         )
         metrics["threshold_enabled"] = True
         metrics["st_filter_mode"] = "current_name_approximation"
@@ -765,7 +783,8 @@ def run_strategy_suite(
         for threshold in thresholds:
             _, sweep_trades, _, sweep_metrics = run_event_strategy(
                 daily, rankings, names, spec, start, end, initial_cash, costs,
-                take_profit=threshold, record_profit=threshold,
+                take_profit=threshold, record_profit=threshold, benchmark_daily=benchmark,
+                limit_daily=limits,
             )
             sweep_rows.append({
                 "strategy_id": spec.strategy_id,
@@ -851,5 +870,6 @@ def run_strategy_lab(
     return run_experiments(
         daily, rankings, names, start, end,
         float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],
-        settings, output,
+        settings, output, benchmark_daily=store.load_market_dataset("benchmark"),
+        limit_daily=store.load_market_dataset("limit"),
     )

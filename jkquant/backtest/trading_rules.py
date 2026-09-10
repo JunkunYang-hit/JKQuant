@@ -20,9 +20,15 @@ def limit_price(pre_close: float, rate: float, direction: int) -> float:
     return float(raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def is_open_limit_up(ts_code: str, open_price: float, pre_close: float) -> bool:
-    return open_price > 0 and pre_close > 0 and open_price >= limit_price(pre_close, price_limit_rate(ts_code), 1) - 0.005
+def is_open_limit_up(
+    ts_code: str, open_price: float, pre_close: float, exact_limit: float | None = None,
+) -> bool:
+    threshold = exact_limit if exact_limit is not None and exact_limit > 0 else limit_price(pre_close, price_limit_rate(ts_code), 1)
+    return open_price > 0 and pre_close > 0 and open_price >= threshold - 0.005
 
 
-def is_open_limit_down(ts_code: str, open_price: float, pre_close: float) -> bool:
-    return open_price > 0 and pre_close > 0 and open_price <= limit_price(pre_close, price_limit_rate(ts_code), -1) + 0.005
+def is_open_limit_down(
+    ts_code: str, open_price: float, pre_close: float, exact_limit: float | None = None,
+) -> bool:
+    threshold = exact_limit if exact_limit is not None and exact_limit > 0 else limit_price(pre_close, price_limit_rate(ts_code), -1)
+    return open_price > 0 and pre_close > 0 and open_price <= threshold + 0.005

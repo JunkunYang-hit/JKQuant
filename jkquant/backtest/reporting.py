@@ -22,7 +22,7 @@ def write_backtest_report(result: BacktestResult, output_dir: Path) -> dict[str,
 
     figure, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, height_ratios=[2, 1])
     axes[0].plot(result.daily["trade_date"], result.daily["equity"], label="Strategy")
-    axes[0].plot(result.daily["trade_date"], result.daily["benchmark_equity"], label="Universe EW")
+    axes[0].plot(result.daily["trade_date"], result.daily["benchmark_equity"], label="CSI 300 ETF (510300)")
     axes[0].set_ylabel("Net value")
     axes[0].legend()
     axes[0].grid(alpha=0.25)

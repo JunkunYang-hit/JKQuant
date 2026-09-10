@@ -28,7 +28,6 @@ def main() -> None:
     print(f"八策略联合近期回测完成：{path}")
     print(f"累计收益：{metrics['cumulative_return']:.2%}")
     print(f"最大回撤：{metrics['max_drawdown']:.2%}")
-    print(f"Sharpe：{metrics['sharpe_ratio']:.3f}")
 
 
 if __name__ == "__main__":
