@@ -11,10 +11,11 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from .backtest.engine import run_backtest as execute_backtest
+from .backtest.metrics import calculate_metrics
 from .backtest.reporting import write_backtest_report
 from .backtest.strategy_lab import run_experiments
 from .backtest.strategy_suite import (
-    BASE_STRATEGIES, STRATEGIES, run_event_strategy, write_strategy_result,
+    BASE_STRATEGIES, STRATEGIES, StrategySpec, run_event_strategy, write_strategy_result,
     write_suite_index,
 )
 from .config import resolve_path
@@ -480,6 +481,127 @@ def stock_signal_reminders(
         "price_change_from_entry": close / entry_price - 1, "price_stop_loss": price_stop_loss,
         "price_stop": price_stop, "price_stop_met": price_stop_met,
     }
+
+
+def run_recent_signal_ensemble(
+    config: dict[str, Any], months: int = 3, end_date: date | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Backtest the eight signal strategies as equal-capital independent sleeves."""
+    if months <= 0:
+        raise ValueError("回测月数必须大于0")
+    definitions = combined_signal_definitions(config)
+    if len(definitions) != 8:
+        raise RuntimeError(f"八策略定义不完整，当前找到 {len(definitions)} 套")
+    store = build_store(config)
+    daily = store.load_daily()
+    if daily.empty:
+        raise RuntimeError("本地没有日线数据")
+    end = min(end_date or date.today(), daily["trade_date"].max().date())
+    start = (pd.Timestamp(end) - pd.DateOffset(months=months)).date()
+    signal_start = start - timedelta(days=30)
+    warm_recommendation_cache(config, signal_start, end)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    rankings = cache.history(strategy_key(_top50_config(config)), signal_start, end)
+    basic = store.load_basic()
+    names = (
+        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
+        .set_index("ts_code")["name"].astype(str).to_dict()
+        if "name" in basic else {}
+    )
+    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
+        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
+        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
+        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
+        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
+
+    initial_cash = float(config["backtest"]["initial_cash"])
+    sleeve_cash = initial_cash / len(definitions)
+    component_daily: list[pd.DataFrame] = []
+    component_summaries: list[dict[str, Any]] = []
+    for definition in definitions:
+        spec = StrategySpec(
+            strategy_id=definition["strategy_id"], name=definition["name"],
+            description=f"八策略联合中的独立资金子账户：{definition['source']}",
+            entry_rank=int(definition["entry_rank"]), exit_rank=int(definition["exit_rank"]),
+            consecutive_rank=(
+                int(definition["consecutive_rank"])
+                if definition["consecutive_rank"] is not None else None
+            ),
+            consecutive_days=int(definition["consecutive_days"]), weighting="equal",
+            exit_confirmation_days=int(definition["confirmation_days"]),
+        )
+        result, trades, _, metrics = run_event_strategy(
+            daily, rankings, names, spec, start, end, sleeve_cash,
+            config["backtest"]["cost"], take_profit=float(definition["take_profit"]),
+            record_profit=float(definition["take_profit"]),
+        )
+        component = result[[
+            "trade_date", "equity_value", "benchmark_return", "turnover",
+            "transaction_cost", "rebalanced", "holdings",
+        ]].copy().set_index("trade_date")
+        component.columns = pd.MultiIndex.from_product([[definition["strategy_id"]], component.columns])
+        component_daily.append(component)
+        component_summaries.append({
+            **definition,
+            "recent_cumulative_return": metrics["cumulative_return"],
+            "recent_annualized_return": metrics["annualized_return"],
+            "recent_sharpe_ratio": metrics["sharpe_ratio"],
+            "recent_max_drawdown": metrics["max_drawdown"],
+            "recent_trade_count": metrics["total_trade_count"],
+            "recent_trade_win_rate": metrics["profitable_trade_rate"],
+            "recent_open_positions": int(trades["status"].eq("持有中").sum()) if not trades.empty else 0,
+        })
+
+    combined = pd.concat(component_daily, axis=1).sort_index()
+    value_columns = [column for column in combined if column[1] == "equity_value"]
+    equity_value = combined[value_columns].sum(axis=1)
+    previous_value = equity_value.shift(1).fillna(initial_cash)
+    net_return = equity_value / previous_value - 1
+    benchmark_columns = [column for column in combined if column[1] == "benchmark_return"]
+    benchmark_return = combined[benchmark_columns[0]]
+    rebalanced_columns = [column for column in combined if column[1] == "rebalanced"]
+    holding_columns = [column for column in combined if column[1] == "holdings"]
+    turnover_value = pd.Series(0.0, index=combined.index)
+    cost_value = pd.Series(0.0, index=combined.index)
+    for definition in definitions:
+        strategy_id = definition["strategy_id"]
+        prior_sleeve_value = combined[(strategy_id, "equity_value")].shift(1).fillna(sleeve_cash)
+        turnover_value += combined[(strategy_id, "turnover")] * prior_sleeve_value
+        cost_value += combined[(strategy_id, "transaction_cost")] * prior_sleeve_value
+    ensemble = pd.DataFrame({
+        "trade_date": combined.index, "signal_date": combined.index,
+        "gross_return": (equity_value + cost_value) / previous_value - 1,
+        "net_return": net_return, "benchmark_return": benchmark_return,
+        "turnover": turnover_value / previous_value,
+        "transaction_cost": cost_value / previous_value,
+        "holdings": combined[holding_columns].sum(axis=1),
+        "rebalanced": combined[rebalanced_columns].any(axis=1),
+        "equity_value": equity_value,
+    }).reset_index(drop=True)
+    ensemble["equity"] = ensemble["equity_value"] / initial_cash
+    ensemble["benchmark_equity"] = (1 + ensemble["benchmark_return"]).cumprod()
+    ensemble["drawdown"] = ensemble["equity"] / ensemble["equity"].cummax() - 1
+    metrics = calculate_metrics(ensemble)
+    metrics.update({
+        "strategy_id": "eight_strategy_equal_sleeves_recent",
+        "strategy_name": "八策略联合（等资金子账户）最近三个月",
+        "strategy_description": "八套策略各使用1/8初始资金并独立执行，组合权益为八个子账户之和。",
+        "requested_months": months, "start_date": start.isoformat(), "end_date": end.isoformat(),
+        "component_count": len(definitions), "selection_bias_warning": (
+            "八套策略由包含本区间的历史结果筛选，本结果是近期稳定性复测，不是严格样本外测试。"
+        ),
+    })
+    output = resolve_path(config, "backtests/signal_ensemble") / f"{start}_{end}"
+    output.mkdir(parents=True, exist_ok=True)
+    daily_path = output / "daily.csv"
+    components_path = output / "components.csv"
+    metrics_path = output / "metrics.json"
+    ensemble.to_csv(daily_path, index=False, encoding="utf-8-sig", float_format="%.8f")
+    pd.DataFrame(component_summaries).sort_values(
+        "recent_cumulative_return", ascending=False,
+    ).to_csv(components_path, index=False, encoding="utf-8-sig", float_format="%.8f")
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return metrics_path, metrics
 def warm_recommendation_cache(
     config: dict[str, Any], start_date: date = RECOMMENDATION_HISTORY_START,
     end_date: date | None = None,

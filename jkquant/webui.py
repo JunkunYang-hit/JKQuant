@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_ROOT = PROJECT_ROOT / "reports"
 BACKTESTS_ROOT = PROJECT_ROOT / "backtests"
 STRATEGY_LAB_ROOT = BACKTESTS_ROOT / "strategy_lab"
+SIGNAL_ENSEMBLE_ROOT = BACKTESTS_ROOT / "signal_ensemble"
 
 SCORE_NAMES = {
     "total_score": "综合得分",
@@ -381,7 +382,13 @@ def render_strategy_overview() -> None:
         width="stretch", hide_index=True,
     )
     st.subheader("累计收益对比")
-    st.bar_chart(comparison.set_index("策略")[["累计收益"]])
+    comparison_chart = alt.Chart(comparison).mark_bar().encode(
+        x=alt.X("累计收益:Q", axis=alt.Axis(format=".0%", labelAngle=0)),
+        y=alt.Y("策略:N", sort="-x", axis=alt.Axis(labelAngle=0, title=None)),
+        tooltip=["策略:N", alt.Tooltip("累计收益:Q", format=".2%")],
+        color=alt.condition(alt.datum["累计收益"] >= 0, alt.value("#d62728"), alt.value("#2ca02c")),
+    ).properties(height=max(360, len(comparison) * 28))
+    st.altair_chart(comparison_chart, width="stretch")
     sweep_path = folder / suite.get("take_profit_sweep_file", "take_profit_sweep.csv")
     if sweep_path.exists():
         sweep = pd.read_csv(sweep_path)
@@ -479,7 +486,6 @@ def render_backtest() -> None:
     folder = st.selectbox("选择策略回测结果", folders, format_func=_result_label)
     metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
     st.info(metrics.get("strategy_description", "旧版定期调仓策略结果。"))
-    daily = pd.read_csv(folder / "daily.csv", parse_dates=["trade_date", "signal_date"])
     trades_path = folder / "trades.csv"
     if not trades_path.exists():
         trades_path = folder / "rebalances.csv"
@@ -519,26 +525,36 @@ def render_backtest() -> None:
         columns[2].metric("平均盈利交易", _percent(metrics.get("average_winner_return", 0)))
         columns[3].metric("平均亏损交易", _percent(metrics.get("average_loser_return", 0)))
 
-    st.subheader("净值曲线")
-    equity = daily.set_index("trade_date")[["equity", "benchmark_equity"]]
-    equity.columns = ["策略", "全市场等权基准"]
-    st.line_chart(equity)
-    st.subheader("回撤")
-    drawdown = daily.set_index("trade_date")[["drawdown"]].rename(columns={"drawdown": "策略回撤"})
-    st.area_chart(drawdown)
-    st.subheader("年度收益")
-    yearly = pd.DataFrame.from_dict(metrics["yearly_returns"], orient="index", columns=["收益"])
-    st.dataframe(yearly.style.format("{:.2%}"), width="stretch")
-    st.subheader("逐日结果")
-    st.dataframe(daily.rename(columns=DAILY_NAMES), width="stretch", hide_index=True, height=380)
-    if trades_path.exists():
+    subpage = st.radio(
+        "分析子页面", ["绩效概览", "逐日结果", "交易区间", "盈利事件"],
+        horizontal=True, key=f"backtest_subpage_{folder}",
+    )
+    if subpage == "绩效概览":
+        daily = pd.read_csv(folder / "daily.csv", parse_dates=["trade_date", "signal_date"])
+        st.subheader("净值曲线")
+        equity = daily.set_index("trade_date")[["equity", "benchmark_equity"]]
+        equity.columns = ["策略", "全市场等权基准"]
+        st.line_chart(equity)
+        st.subheader("回撤")
+        drawdown = daily.set_index("trade_date")[["drawdown"]].rename(columns={"drawdown": "策略回撤"})
+        st.area_chart(drawdown)
+        st.subheader("年度收益")
+        yearly = pd.DataFrame.from_dict(metrics["yearly_returns"], orient="index", columns=["收益"])
+        st.dataframe(yearly.style.format("{:.2%}"), width="stretch")
+    elif subpage == "逐日结果":
+        daily = pd.read_csv(folder / "daily.csv", parse_dates=["trade_date", "signal_date"])
+        st.subheader("逐日结果")
+        st.dataframe(daily.rename(columns=DAILY_NAMES), width="stretch", hide_index=True, height=680)
+    elif subpage == "交易区间" and trades_path.exists():
         st.subheader("交易与持股区间")
         trades = pd.read_csv(trades_path).rename(columns=TRADE_NAMES)
         for column in ["价格变化", "净收益", "持有期最大盈利", "持有期最大不利波动"]:
             if column in trades:
                 trades[column] = trades[column].map(lambda value: f"{value:.2%}")
-        st.dataframe(trades, width="stretch", hide_index=True)
-    if events_path.exists() and metrics.get("threshold_enabled", True):
+        st.dataframe(trades, width="stretch", hide_index=True, height=680)
+    elif subpage == "交易区间":
+        st.info("该回测没有交易区间明细。")
+    elif subpage == "盈利事件" and events_path.exists() and metrics.get("threshold_enabled", True):
         st.subheader("盈利阈值事件")
         events = pd.read_csv(events_path).rename(columns=EVENT_NAMES)
         if events.empty:
@@ -549,7 +565,9 @@ def render_backtest() -> None:
             for column in ["最终价格变化", "最终净收益"]:
                 if column in events:
                     events[column] = events[column].map(lambda value: f"{value:.2%}")
-            st.dataframe(events, width="stretch", hide_index=True)
+            st.dataframe(events, width="stretch", hide_index=True, height=680)
+    elif subpage == "盈利事件":
+        st.info("该策略没有单独的盈利阈值事件页面。")
     st.caption(
         "成交规则说明：信号在收盘后产生，次一交易日开盘执行；开盘封涨停时买单视为无法成交，"
         "开盘封跌停时卖单顺延。持有期最大盈利越高表示曾出现更大浮盈；最大不利波动越负表示持仓期间承受的下跌越深。"
@@ -622,7 +640,13 @@ def render_strategy_lab() -> None:
             "年化波动": "{:.2%}", "交易胜率": "{:.2%}", "平均持有交易日": "{:.1f}",
         }), width="stretch", hide_index=True, height=760,
     )
-    st.bar_chart(results.set_index("experiment_id")[["cumulative_return"]])
+    chart_data = results[["strategy_name", "cumulative_return"]].copy()
+    lab_chart = alt.Chart(chart_data).mark_bar().encode(
+        x=alt.X("cumulative_return:Q", title="累计收益", axis=alt.Axis(format=".0%", labelAngle=0)),
+        y=alt.Y("strategy_name:N", title=None, sort="-x", axis=alt.Axis(labelAngle=0)),
+        tooltip=["strategy_name:N", alt.Tooltip("cumulative_return:Q", format=".2%")],
+    ).properties(height=max(360, len(chart_data) * 30))
+    st.altair_chart(lab_chart, width="stretch")
     st.warning(
         "前二十名是在同一段历史数据上从大量组合中筛出的样本内结果，存在明显的数据挖掘和参数过拟合风险。"
         "最终参数必须用未参与本次排名的后续数据做样本外验证。"
@@ -632,6 +656,44 @@ def render_strategy_lab() -> None:
 def render_signal_alerts() -> None:
     st.title("交易信号提醒")
     st.caption("合并策略试验场前五名与原联合推荐前三名，共八套规则。页面只生成研究提醒，不会自动下单。")
+    ensemble_folders = sorted(
+        {path.parent for path in SIGNAL_ENSEMBLE_ROOT.glob("*/metrics.json")}, reverse=True,
+    )
+    if ensemble_folders:
+        ensemble_folder = ensemble_folders[0]
+        ensemble_metrics = json.loads((ensemble_folder / "metrics.json").read_text(encoding="utf-8"))
+        st.subheader("八策略联合近期稳定性复测")
+        recent_cards = st.columns(5)
+        recent_cards[0].metric("最近三个月累计收益", _percent(ensemble_metrics["cumulative_return"]))
+        recent_cards[1].metric("同期基准收益", _percent(ensemble_metrics["benchmark_return"]))
+        recent_cards[2].metric("超额收益", _percent(ensemble_metrics["excess_return"]))
+        recent_cards[3].metric("最大回撤", _percent(ensemble_metrics["max_drawdown"]))
+        recent_cards[4].metric("Sharpe", f"{ensemble_metrics['sharpe_ratio']:.3f}")
+        st.warning(ensemble_metrics.get("selection_bias_warning", "该复测不是严格样本外检验。"))
+        components_path = ensemble_folder / "components.csv"
+        if components_path.exists():
+            components = pd.read_csv(components_path).rename(columns={
+                "source": "来源", "name": "策略", "historical_return": "完整区间收益",
+                "recent_cumulative_return": "最近三个月收益",
+                "recent_sharpe_ratio": "近期Sharpe", "recent_max_drawdown": "近期最大回撤",
+                "recent_trade_count": "近期交易次数", "recent_trade_win_rate": "近期交易胜率",
+            })
+            with st.expander("查看八个子策略近期表现"):
+                st.dataframe(
+                    components[["来源", "策略", "完整区间收益", "最近三个月收益", "近期Sharpe", "近期最大回撤", "近期交易次数", "近期交易胜率"]]
+                    .style.format({
+                        "完整区间收益": "{:.2%}", "最近三个月收益": "{:.2%}",
+                        "近期Sharpe": "{:.3f}", "近期最大回撤": "{:.2%}", "近期交易胜率": "{:.2%}",
+                    }), width="stretch", hide_index=True,
+                )
+                component_chart = alt.Chart(components).mark_bar().encode(
+                    x=alt.X("最近三个月收益:Q", axis=alt.Axis(format=".0%", labelAngle=0)),
+                    y=alt.Y("策略:N", sort="-x", axis=alt.Axis(labelAngle=0, title=None)),
+                    tooltip=["策略:N", alt.Tooltip("最近三个月收益:Q", format=".2%")],
+                    color=alt.condition(alt.datum["最近三个月收益"] >= 0, alt.value("#d62728"), alt.value("#2ca02c")),
+                ).properties(height=320)
+                st.altair_chart(component_chart, width="stretch")
+        st.divider()
     config = load_config(PROJECT_ROOT / "config.yaml")
     dates = _selection_dates()
     if not dates:
@@ -738,10 +800,19 @@ def render_signal_alerts() -> None:
         "rank_exit_met": "排名退出已触发", "signal": "当前信号",
     })
     st.subheader("逐策略信号明细")
+    detail_style = detail.style.format({
+        "历史累计收益": "{:.2%}", "止盈比例": "{:.0%}", "止盈价": "{:.2f}",
+    })
+    if held:
+        liquidation_signals = {"止盈", "策略退出", "价格止损预警"}
+        detail_style = detail_style.apply(
+            lambda row: [
+                "color:#16a34a;font-weight:700" if row["当前信号"] in liquidation_signals else ""
+                for _ in row
+            ], axis=1,
+        )
     st.dataframe(
-        detail.style.format({
-            "历史累计收益": "{:.2%}", "止盈比例": "{:.0%}", "止盈价": "{:.2f}",
-        }), width="stretch", hide_index=True, height=520,
+        detail_style, width="stretch", hide_index=True, height=520,
     )
     st.caption(
         "排名退出依据所选日期收盘后的 Top50 历史连续判断，实际卖出安排在下一交易日开盘；"
