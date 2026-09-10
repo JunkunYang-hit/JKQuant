@@ -42,6 +42,28 @@ strategy:
     risk: 0.20
     liquidity: 0.15
 
+strategy_profiles:
+  baseline:
+    name: 原固定权重
+    description: 动量40%、趋势25%、低风险20%、流动性15%，保留作为基准对照。
+  recent_defensive:
+    name: 近期低波动防守（研究）
+    description: 根据最近252交易日诊断降低趋势与动量权重，重点使用低波动；只作为新策略对照，不覆盖原策略。
+    category_weights:
+      momentum: 0.10
+      trend: 0.10
+      risk: 0.70
+      liquidity: 0.10
+    factor_weights:
+      return_5d: 0.70
+      return_20d: 0.30
+      close_ma20: 0.50
+      ma5_ma20: 0.50
+      volatility_20d: 0.90
+      max_drawdown_20d: 0.10
+      amount_mean_20d: 0.25
+      amount_ratio_5_20: 0.75
+
 report:
   output_dir: reports
 
@@ -55,8 +77,9 @@ backtest:
   benchmark: 510300.SH
   output_dir: backtests
   cost:
-    commission_buy: 0.0003
-    commission_sell: 0.0003
+    commission_buy: 0.0005
+    commission_sell: 0.0005
+    min_commission: 5
     stamp_tax: 0.0005
     slippage: 0.0005
 

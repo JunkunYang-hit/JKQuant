@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from jkquant.ai import get_cached_analysis, run_ai_analysis, test_ai_connection
-from jkquant.config import load_config
+from jkquant.config import apply_strategy_profile, load_config
 from jkquant.data.account_store import AccountStore
 from jkquant.factors import FACTOR_COLUMNS
 from jkquant.holiday_risk import holiday_risk
@@ -261,14 +261,14 @@ def render_topk() -> None:
         elif holiday_status and holiday_status["level"] == "safe":
             st.success("安全提示：未来两天内没有中国法定节假日开始。")
     st.caption("2000 积分数据模式：证券简称来自 Tushare 股票列表，推荐仍以已验证的量价因子为主。")
-    config = load_config(PROJECT_ROOT / "config.yaml")
+    base_config = load_config(PROJECT_ROOT / "config.yaml")
     action_col, _ = st.columns([1.8, 6.2])
     if action_col.button("更新数据并计算今日推荐", type="primary", use_container_width=True):
         with st.spinner("正在更新最新数据、计算 Top-50 并同步信号缓存……"):
             try:
-                report_path, _ = run_daily(config, date.today())
-                latest_date = build_store(config).load_daily()["trade_date"].max().date()
-                combined_signal_recommendations(config, latest_date)
+                report_path, _ = run_daily(base_config, date.today())
+                latest_date = build_store(base_config).load_daily()["trade_date"].max().date()
+                combined_signal_recommendations(base_config, latest_date)
                 st.success(f"已完成 {latest_date} 推荐并同步到其他模块：{report_path.name}")
             except Exception as exc:
                 st.error(f"今日推荐计算失败：{exc}")
@@ -276,13 +276,13 @@ def render_topk() -> None:
     if not dates:
         st.info("尚无本地历史行情。请先运行：python scripts/update_data.py")
         return
-    configured_top_k = int(config["strategy"]["top_k"])
+    configured_top_k = int(base_config["strategy"]["top_k"])
     try:
         default_top_k = int(os.getenv("JKQUANT_TOP_K", configured_top_k))
     except ValueError:
         default_top_k = configured_top_k
     default_top_k = min(max(default_top_k, 1), 50)
-    filter_left, filter_right, _ = st.columns([1.1, 1.5, 5.4])
+    filter_left, filter_right, profile_col, _ = st.columns([1.1, 1.5, 2.2, 3.2])
     top_k = int(filter_left.number_input(
         "推荐股票数量 K", min_value=1, max_value=50, value=default_top_k, step=1,
         help="数据库统一缓存 Top-50，修改 K 只截取前 K。",
@@ -291,7 +291,14 @@ def render_topk() -> None:
         "选择推荐日期", value=date.today(), min_value=dates[0],
         max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD",
     )
+    profiles = base_config.get("strategy_profiles", {"baseline": {"name": "原固定权重"}})
+    profile_id = profile_col.selectbox(
+        "候选策略", list(profiles), format_func=lambda value: profiles[value].get("name", value),
+        help="防守型策略是独立研究对照，不会覆盖原固定策略。",
+    )
+    config = apply_strategy_profile(base_config, profile_id)
     config["strategy"]["top_k"] = top_k
+    st.caption(profiles[profile_id].get("description", ""))
     available = [value for value in dates if value <= requested_date]
     selected_date = available[-1] if available else dates[0]
     if selected_date != requested_date:
@@ -662,7 +669,9 @@ def render_factor_diagnostics() -> None:
     st.altair_chart(heatmap, width="stretch")
     with st.expander("如何判断这些数值"):
         st.markdown(
-            "- **RankIC**：因子排序与未来收益排序的相关系数。这里已按策略方向统一，正数代表当前方向有效；"
+            "- **IC（Information Coefficient，信息系数）**：因子数值与未来收益的相关系数，用来回答‘因子高低是否真的对应后续收益高低’。\n"
+            "- **RankIC**：先把因子和未来收益各自转成排名，再计算IC，因此更关注排序是否正确，且不容易被少数极端值影响。"
+            "这里已按策略方向统一，正数代表当前方向有效；"
             "绝对值低于0.02通常很弱，0.02～0.05有一定信息，超过0.05值得重点复核，但不是通用保证。\n"
             "- **RankIC为正占比**：越高越稳定；长期明显高于50%较好，接近50%说明方向不稳定。\n"
             "- **多空组收益差**：最强Q5组减最弱Q1组；正数说明分层方向正确，越大越好。\n"
@@ -1194,6 +1203,14 @@ def render_signal_alerts() -> None:
 def render_account() -> None:
     st.title("账户")
     st.caption("持仓保存在本机 SQLite；系统只记录和监控，不会连接券商或自动下单。")
+    holiday_status = holiday_risk(date.today())
+    if holiday_status and holiday_status["level"] == "warning":
+        st.warning(
+            f"节前风险提示：距离{holiday_status['holiday_name']}假期还有 "
+            f"{holiday_status['days_ahead']} 天。请重点检查持仓流动性、隔夜风险和是否需要降低仓位。"
+        )
+    elif holiday_status and holiday_status["level"] == "safe":
+        st.success("风险日历：未来两天内没有中国法定节假日开始。")
     config = load_config(PROJECT_ROOT / "config.yaml")
     store = build_store(config)
     account = _account_store()
@@ -1204,6 +1221,50 @@ def render_account() -> None:
         [["ts_code", "close", "trade_date"]] if not daily.empty else pd.DataFrame()
     )
     if not holdings.empty:
+        latest_date = daily["trade_date"].max().date()
+        signal_rows = []
+        for _, holding in holdings.iterrows():
+            try:
+                reminders, market = stock_signal_reminders(
+                    config, latest_date, str(holding["ts_code"]),
+                    float(holding["cost_price"]), 0.10,
+                )
+                take_profit_count = int(reminders["take_profit_met"].sum())
+                rank_exit_count = int(reminders["rank_exit_met"].sum())
+                stop_met = bool(market["price_stop_met"])
+                if take_profit_count or rank_exit_count or stop_met:
+                    signal = "检查清仓"
+                else:
+                    signal = "继续观察"
+                signal_rows.append({
+                    "股票代码": holding["ts_code"], "证券简称": holding["name"],
+                    "当前信号": signal, "触发止盈策略": take_profit_count,
+                    "触发排名退出策略": rank_exit_count,
+                    "辅助10%止损": "已触发" if stop_met else "未触发",
+                    "相对成本收益": market["price_change_from_entry"],
+                    "信号日期": latest_date,
+                })
+            except Exception as exc:
+                signal_rows.append({
+                    "股票代码": holding["ts_code"], "证券简称": holding["name"],
+                    "当前信号": "数据不足", "触发止盈策略": 0,
+                    "触发排名退出策略": 0, "辅助10%止损": "未知",
+                    "相对成本收益": pd.NA, "信号日期": latest_date,
+                    "说明": str(exc),
+                })
+        st.subheader("持仓卖出信号")
+        signals = _integerize_counts(pd.DataFrame(signal_rows))
+        signal_style = signals.style.format({"相对成本收益": "{:.2%}"}, na_rep="—").apply(
+            lambda row: [
+                "color:#16a34a;font-weight:700" if row["当前信号"] == "检查清仓" else ""
+                for _ in row
+            ], axis=1,
+        )
+        st.dataframe(signal_style, width="stretch", hide_index=True)
+        st.caption(
+            "“检查清仓”表示至少一套联合策略触发止盈/排名退出，或价格触及辅助10%止损；"
+            "排名退出按收盘信号在下一交易日开盘尝试执行，跌停时可能无法卖出。"
+        )
         view = holdings.merge(latest, on="ts_code", how="left")
         view["market_value"] = view["quantity"] * view["close"]
         view["cost_value"] = view["quantity"] * view["cost_price"]
@@ -1319,7 +1380,7 @@ def render_system_help() -> None:
         "5. **横截面打分**：把当日每个因子转成 0～1 的市场百分位得分。\n"
         "6. **生成候选**：按综合得分从高到低输出 Top-K，供人工继续研究。\n"
         "7. **诊断因子**：检查各因子与未来1/5/20日收益的RankIC、分层收益、稳定性和重复度。\n"
-        "8. **历史回测**：使用前一交易日信号，在下一交易日执行，计入佣金、印花税和滑点。"
+        "8. **历史回测**：使用前一交易日信号，在下一交易日执行；佣金万分之五且每笔最低5元，卖出另计印花税，并计入滑点。"
     )
     st.subheader("当前量价策略")
     st.markdown(
@@ -1327,7 +1388,9 @@ def render_system_help() -> None:
         "- **趋势 25%**：价格高于20日均线、5日均线高于20日均线得分更高。\n"
         "- **低风险 20%**：20日波动和回撤越小得分越高。\n"
         "- **流动性 15%**：平均成交额和近期成交活跃度较高得分更高。\n\n"
-        "这是一套固定规则，并不是 AI 预测模型。真实回测目前显著跑输基准，因此 Top-K 只能作为研究清单。"
+        "这是原固定权重，并不是 AI 预测模型。每日候选还提供独立的‘近期低波动防守’对照："
+        "动量10%、趋势10%、低风险70%、流动性10%，其中低风险类别内波动率占90%。"
+        "该比例来自最近252交易日诊断，只用于对照，尚不能视为未来最优。"
     )
     st.subheader("回测中的‘收益’从哪里来")
     st.markdown(
@@ -1338,7 +1401,7 @@ def render_system_help() -> None:
     st.subheader("仍需补齐的关键模块")
     st.markdown(
         "- 基于诊断结果做滚动样本外因子权重校准，避免在同一区间反复挑参数。\n"
-        "- 盘中开板排队、停牌延续、100股整数手和最低佣金等更精细的成交约束。\n"
+        "- 盘中开板排队、停牌延续、100股整数手和实际冲击成本等更精细的成交约束。\n"
         "- 更严格的历史 ST、退市、名称和指数成分时点数据。\n"
         "- 完整复权价格和更多可比较指数基准。\n"
         "- 行业、市值暴露约束，以及自定义/指数股票池。\n"
@@ -1353,31 +1416,20 @@ def main() -> None:
     title.markdown("## JKQuant 选股系统")
     if refresh.button("刷新"):
         st.rerun()
-    page = st.radio(
-        "模块", ["每日候选", "AI分析", "因子诊断", "交易信号提醒", "账户", "策略总览", "策略分析", "策略试验场", "数据中心", "系统说明"],
-        horizontal=True, label_visibility="collapsed",
-    )
+    navigation = st.navigation([
+        st.Page(render_topk, title="每日候选", icon="📋", url_path="candidates", default=True),
+        st.Page(render_ai_analysis, title="AI分析", icon="🤖", url_path="ai-analysis"),
+        st.Page(render_factor_diagnostics, title="因子诊断", icon="🔬", url_path="factor-diagnostics"),
+        st.Page(render_signal_alerts, title="交易信号提醒", icon="🔔", url_path="signals"),
+        st.Page(render_account, title="账户", icon="💼", url_path="account"),
+        st.Page(render_strategy_overview, title="策略总览", icon="📊", url_path="strategies"),
+        st.Page(render_backtest, title="策略分析", icon="📈", url_path="backtest"),
+        st.Page(render_strategy_lab, title="策略试验场", icon="🧪", url_path="strategy-lab"),
+        st.Page(render_data_center, title="数据中心", icon="🗄️", url_path="data"),
+        st.Page(render_system_help, title="系统说明", icon="ℹ️", url_path="help"),
+    ], position="top")
     st.divider()
-    if page == "每日候选":
-        render_topk()
-    elif page == "AI分析":
-        render_ai_analysis()
-    elif page == "因子诊断":
-        render_factor_diagnostics()
-    elif page == "交易信号提醒":
-        render_signal_alerts()
-    elif page == "账户":
-        render_account()
-    elif page == "策略总览":
-        render_strategy_overview()
-    elif page == "策略试验场":
-        render_strategy_lab()
-    elif page == "策略分析":
-        render_backtest()
-    elif page == "数据中心":
-        render_data_center()
-    else:
-        render_system_help()
+    navigation.run()
 
 
 if __name__ == "__main__":

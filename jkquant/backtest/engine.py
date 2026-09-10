@@ -10,7 +10,7 @@ from ..factors import calculate_factors
 from ..strategy import select_stocks
 from .metrics import calculate_metrics
 from .benchmark import benchmark_return_map
-from .trading_rules import is_open_limit_down, is_open_limit_up
+from .trading_rules import is_open_limit_down, is_open_limit_up, transaction_fee
 
 
 @dataclass
@@ -69,6 +69,7 @@ def run_backtest(
     records: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     benchmark_returns = benchmark_return_map(benchmark_daily)
+    running_equity = float(settings["initial_cash"])
 
     all_dates = sorted(pd.Timestamp(value) for value in factors["trade_date"].unique())
     date_position = {value: index for index, value in enumerate(all_dates)}
@@ -119,14 +120,22 @@ def run_backtest(
             buy = sum(max(value, 0.0) for value in changes.values())
             sell = sum(max(-value, 0.0) for value in changes.values())
             turnover = buy + sell
-            cost_rate = (
-                buy * (float(costs["commission_buy"]) + float(costs["slippage"]))
-                + sell * (
-                    float(costs["commission_sell"])
-                    + float(costs["stamp_tax"])
-                    + float(costs["slippage"])
-                )
-            )
+            minimum = float(costs.get("min_commission", 0.0))
+            cost_amount = 0.0
+            for change in changes.values():
+                notional = running_equity * abs(change)
+                if change > 0:
+                    cost_amount += transaction_fee(
+                        notional, float(costs["commission_buy"]),
+                        min_commission=minimum, slippage_rate=float(costs["slippage"]),
+                    )
+                elif change < 0:
+                    cost_amount += transaction_fee(
+                        notional, float(costs["commission_sell"]),
+                        min_commission=minimum, stamp_tax_rate=float(costs["stamp_tax"]),
+                        slippage_rate=float(costs["slippage"]),
+                    )
+            cost_rate = cost_amount / running_equity if running_equity else 0.0
             overnight = market_today["open"] / market_today["pre_close"] - 1
             intraday = market_today["close"] / market_today["open"] - 1
             gross_return = (1 + _weighted_return(holdings, overnight)) * (
@@ -143,7 +152,8 @@ def run_backtest(
         else:
             gross_return = _weighted_return(holdings, close_return)
 
-        net_return = (1 + gross_return) * (1 - cost_rate) - 1
+        net_return = gross_return - cost_rate
+        running_equity *= 1 + net_return
         records.append({
             "trade_date": trade_date,
             "signal_date": signal_date,
@@ -169,5 +179,6 @@ def run_backtest(
     metrics.update({
         "limit_up_buy_blocked_count": int(result["limit_up_buy_blocked"].sum()),
         "limit_down_sell_blocked_count": int(result["limit_down_sell_blocked"].sum()),
+        "cost_model": dict(costs),
     })
     return BacktestResult(result, pd.DataFrame(trades), metrics)

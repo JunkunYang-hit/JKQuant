@@ -4,6 +4,7 @@ import pandas as pd
 import yaml
 
 from jkquant.backtest.engine import _target_weights, run_backtest
+from jkquant.backtest.trading_rules import affordable_buy_notional, transaction_fee
 from jkquant.backtest.reporting import write_backtest_report
 from jkquant.data.demo_provider import DemoProvider
 
@@ -31,3 +32,13 @@ def test_rank_linear_weights_favor_higher_ranks() -> None:
     weights = _target_weights(["A", "B", "C"], "rank_linear")
     assert weights == {"A": 0.5, "B": 1 / 3, "C": 1 / 6}
     assert abs(sum(weights.values()) - 1) < 1e-12
+
+
+def test_commission_uses_five_yuan_floor_per_order() -> None:
+    assert transaction_fee(5_000, 0.0005, min_commission=5) == 5
+    assert transaction_fee(20_000, 0.0005, min_commission=5) == 10
+    assert transaction_fee(
+        5_000, 0.0005, min_commission=5, stamp_tax_rate=0.0005,
+    ) == 7.5
+    gross = affordable_buy_notional(5_005, 0.0005, min_commission=5)
+    assert gross == 5_000

@@ -100,7 +100,11 @@ def run_daily(config: dict[str, Any], end_date: date | None = None) -> tuple[Pat
     if top50.empty:
         raise RuntimeError("过滤后没有足够数据生成选股结果，请检查配置和数据完整性")
     selection = top50.head(requested_top_k).copy()
-    path = write_csv(selection, resolve_path(config, config["report"]["output_dir"]))
+    report_dir = resolve_path(config, config["report"]["output_dir"])
+    profile_id = config["strategy"].get("profile_id")
+    if profile_id:
+        report_dir = report_dir / str(profile_id)
+    path = write_csv(selection, report_dir)
     SelectionCache(store.root / "selection_results.sqlite3").put(
         strategy_key(cache_config), factors["trade_date"].max().date(), top50
     )
@@ -674,7 +678,11 @@ def run_historical_backtest(
         daily, store.load_basic(), config, start, end,
         store.load_market_dataset("benchmark"), store.load_market_dataset("limit"),
     )
-    folder = resolve_path(config, settings["output_dir"]) / f"{start}_{end}"
+    folder_name = f"{start}_{end}"
+    profile_id = config["strategy"].get("profile_id")
+    if profile_id:
+        folder_name = f"{profile_id}_{folder_name}"
+    folder = resolve_path(config, settings["output_dir"]) / folder_name
     paths = write_backtest_report(result, folder)
     LOGGER.info("回测完成: %s", folder)
     return paths, result.metrics

@@ -6,7 +6,7 @@ import pytest
 import pandas as pd
 import yaml
 
-from jkquant.config import load_config
+from jkquant.config import apply_strategy_profile, load_config
 from jkquant.pipeline import (
     best_strategy_recommendations, combined_signal_definitions, run_daily,
     selection_for_date,
@@ -123,3 +123,13 @@ def test_combined_signal_definitions_use_lab_five_and_suite_three(tmp_path: Path
     assert sum(item["source"] == "策略试验场前五" for item in definitions) == 5
     assert sum(item["source"] == "原联合推荐前三" for item in definitions) == 3
     assert all(item["strategy_id"] != "s04_top50_streak2" for item in definitions)
+
+
+def test_defensive_profile_does_not_mutate_baseline_config() -> None:
+    config = load_config("config.yaml")
+    baseline = apply_strategy_profile(config, "baseline")
+    defensive = apply_strategy_profile(config, "recent_defensive")
+    assert "profile_id" not in baseline["strategy"]
+    assert defensive["strategy"]["category_weights"]["risk"] == 0.70
+    assert defensive["strategy"]["factors"]["volatility_20d"]["weight"] == 0.90
+    assert config["strategy"]["category_weights"]["risk"] == 0.20

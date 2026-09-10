@@ -11,7 +11,9 @@ import pandas as pd
 
 from .metrics import calculate_metrics
 from .benchmark import benchmark_return_map
-from .trading_rules import is_open_limit_down, is_open_limit_up
+from .trading_rules import (
+    affordable_buy_notional, is_open_limit_down, is_open_limit_up, transaction_fee,
+)
 
 
 @dataclass(frozen=True)
@@ -104,8 +106,11 @@ def run_event_strategy(
     trades: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     trade_sequence = 0
-    buy_rate = float(costs["commission_buy"]) + float(costs["slippage"])
-    sell_rate = float(costs["commission_sell"]) + float(costs["stamp_tax"]) + float(costs["slippage"])
+    buy_commission = float(costs["commission_buy"])
+    sell_commission = float(costs["commission_sell"])
+    min_commission = float(costs.get("min_commission", 0.0))
+    stamp_tax = float(costs["stamp_tax"])
+    slippage = float(costs["slippage"])
     record_label = f"盈利达到{record_profit:.0%}" if record_profit is not None else ""
     take_profit_label = f"盈利达到{take_profit:.0%}止盈" if take_profit is not None else ""
 
@@ -125,7 +130,10 @@ def run_event_strategy(
     def sell(code: str, position: dict[str, Any], trade_date: pd.Timestamp, price: float, reason: str) -> tuple[float, float]:
         nonlocal cash
         gross = float(position["shares"] * price)
-        fee = gross * sell_rate
+        fee = transaction_fee(
+            gross, sell_commission, min_commission=min_commission,
+            stamp_tax_rate=stamp_tax, slippage_rate=slippage,
+        )
         cash += gross - fee
         net_return = (gross - fee) / float(position["cost_basis"]) - 1
         trades.append({
@@ -224,12 +232,20 @@ def run_event_strategy(
             total_cash_budget = (
                 required_cash if spec.capital_fraction_per_entry is not None else cash
             )
-            gross_budget = total_cash_budget / (1 + buy_rate)
             for code, rank in candidates:
-                trade_sequence += 1
                 open_price = float(market.at[code, "open"])
-                gross = gross_budget * allocations[code]
-                fee = gross * buy_rate
+                cash_budget = total_cash_budget * allocations[code]
+                gross = affordable_buy_notional(
+                    cash_budget, buy_commission,
+                    min_commission=min_commission, slippage_rate=slippage,
+                )
+                if gross <= 0:
+                    continue
+                fee = transaction_fee(
+                    gross, buy_commission,
+                    min_commission=min_commission, slippage_rate=slippage,
+                )
+                trade_sequence += 1
                 shares = gross / open_price
                 cash -= gross + fee
                 positions[code] = {
@@ -325,6 +341,7 @@ def run_event_strategy(
         "limit_up_buy_blocked_count": int(result["limit_up_buy_blocked"].sum()),
         "limit_down_sell_blocked_count": int(result["limit_down_sell_blocked"].sum()),
         "take_profit_model": "不设固定止盈" if take_profit is None else f"日内最高价触及{take_profit:.0%}时按目标价卖出；开盘跳空越过时按开盘价",
+        "cost_model": dict(costs),
     })
     return result, trades_frame, events_frame, metrics
 

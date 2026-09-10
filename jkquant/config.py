@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 from typing import Any
 
 import yaml
@@ -40,6 +41,10 @@ def _validate(config: dict[str, Any]) -> None:
         costs = backtest["cost"]
         if any(float(value) < 0 for value in costs.values()):
             raise ValueError("回测交易成本不能为负数")
+    for profile_id, profile in config.get("strategy_profiles", {}).items():
+        weights = profile.get("category_weights")
+        if weights and abs(sum(float(value) for value in weights.values()) - 1.0) > 1e-9:
+            raise ValueError(f"策略配置 {profile_id} 的类别权重之和必须为 1")
     if "strategy_suite" in config:
         suite = config["strategy_suite"]
         record_profit = float(suite.get("record_profit", 0.20))
@@ -73,3 +78,23 @@ def resolve_path(config: dict[str, Any], value: str) -> Path:
     if path.is_absolute():
         return path
     return Path(config["_config_dir"]) / path
+
+
+def apply_strategy_profile(config: dict[str, Any], profile_id: str) -> dict[str, Any]:
+    """Return an isolated config with one named scoring profile applied."""
+    profiles = config.get("strategy_profiles", {})
+    if profile_id not in profiles:
+        raise ValueError(f"未知策略配置：{profile_id}")
+    result = deepcopy(config)
+    profile = profiles[profile_id]
+    if profile_id == "baseline" and not profile.get("category_weights") and not profile.get("factor_weights"):
+        return result
+    if "category_weights" in profile:
+        result["strategy"]["category_weights"] = deepcopy(profile["category_weights"])
+    for factor, weight in profile.get("factor_weights", {}).items():
+        if factor not in result["strategy"]["factors"]:
+            raise ValueError(f"策略配置 {profile_id} 包含未知因子：{factor}")
+        result["strategy"]["factors"][factor]["weight"] = float(weight)
+    result["strategy"]["profile_id"] = profile_id
+    result["strategy"]["profile_name"] = profile.get("name", profile_id)
+    return result
