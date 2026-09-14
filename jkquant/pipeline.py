@@ -721,6 +721,60 @@ def run_historical_backtest(
     return paths, result.metrics
 
 
+def run_streak2_leader_backtest(
+    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Run the exact-two-day Top20 leader strategy against local point-in-time signals."""
+    store = build_store(config)
+    daily = store.load_daily()
+    if daily.empty:
+        raise RuntimeError("本地没有日线数据，请先运行每日更新")
+    local_end = daily["trade_date"].max().date()
+    end = min(end_date or local_end, local_end)
+    start = start_date or RECOMMENDATION_HISTORY_START
+    if start >= end:
+        raise ValueError("回测开始日期必须早于本地最新交易日")
+    warm_recommendation_cache(config, RECOMMENDATION_HISTORY_START, end)
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    rankings = cache.history(
+        strategy_key(_top50_config(config)), RECOMMENDATION_HISTORY_START, end,
+    )
+    basic = store.load_basic()
+    names = (
+        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
+        .set_index("ts_code")["name"].astype(str).to_dict()
+        if "name" in basic else {}
+    )
+    excluded_st_count = 0
+    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
+        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
+        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
+        excluded_st_count = len(st_codes)
+        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
+        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
+    spec = next(
+        item for item in STRATEGIES
+        if item.strategy_id == "s14_top20_exact2_leader_full"
+    )
+    result, trades, events, metrics = run_event_strategy(
+        daily, rankings, names, spec, start, end,
+        float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],
+        take_profit=0.32, record_profit=0.32,
+        benchmark_daily=store.load_market_dataset("benchmark"),
+        limit_daily=store.load_market_dataset("limit"),
+    )
+    metrics.update({
+        "threshold_enabled": True,
+        "st_filter_mode": "current_name_approximation",
+        "excluded_st_count": excluded_st_count,
+        "signal_execution": "收盘确认信号，下一交易日开盘执行",
+    })
+    output = resolve_path(config, "backtests/streak2_leader") / f"{start}_{end}"
+    write_strategy_result(output, result, trades, events, metrics)
+    LOGGER.info("连续2次Top20领跑者策略回测完成: %s", output)
+    return output, metrics
+
+
 def run_strategy_suite(
     config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
 ) -> tuple[Path, list[dict[str, Any]]]:

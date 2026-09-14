@@ -63,6 +63,7 @@ JKQuant/
 │   ├── run_strategy_suite.py   # 执行当前策略组合，并扫描保留策略的止盈阈值
 │   ├── run_strategy_lab.py     # 运行最佳策略的多参数消融试验，支持断点续跑
 │   ├── run_signal_ensemble.py  # 将八策略按等资金子账户回测最近若干月
+│   ├── run_streak2_leader_backtest.py # 回测连续2次Top20领跑者全仓策略
 │   ├── run_ai_analysis.py      # 命令行生成/读取指定日期的DeepSeek分析
 │   └── run_webui.py            # 启动本地 WebUI 并自动打开浏览器
 ├── tests/                      # 因子无未来数据、完整流程和回测测试
@@ -304,6 +305,14 @@ python scripts/run_signal_ensemble.py --months 3
 ```
 
 结果写入 `backtests/signal_ensemble/开始日期_结束日期/`，并显示在“交易信号提醒”页面。由于八套规则是从包含该三个月的完整历史区间中筛选出来的，该结果只能视为近期稳定性检查，不是严格样本外验证。
+
+连续2次Top20领跑者全仓策略使用收盘后可确认的排名信号，在下一交易日开盘执行，避免未来数据泄漏。若买入后的下一次排名没有完成连续第3次Top20，则在再下一交易日开盘退出；完成第3次后持有到首次跌出Top20，或日内最高价触及32%止盈线。运行完整历史与最近三个月：
+
+```powershell
+python scripts/run_streak2_leader_backtest.py
+```
+
+结果分别写入 `backtests/streak2_leader/开始日期_结束日期/`，并计入万分之五且最低5元佣金、卖出印花税、滑点以及开盘涨跌停约束。
 
 ## 当前边界
 

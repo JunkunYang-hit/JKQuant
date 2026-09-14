@@ -31,6 +31,7 @@ class StrategySpec:
     capital_fraction_per_entry: float | None = None
     max_positions: int | None = None
     fixed_take_profit: float | None = None
+    exact_consecutive_days: bool = False
 
 
 STRATEGIES = [
@@ -48,6 +49,11 @@ STRATEGIES = [
     StrategySpec("s10_top5_equal_exit10_confirm2", "当日Top5等权，跌出Top10卖出（两日确认）", "等权买入当日Top5；连续两个信号日跌出Top10才卖出。", 5, 10, None, 1, "equal", 2),
     StrategySpec("s12_top1_streak3_half", "Top1且连续3次Top20，半仓买入", "只买当日Top1且连续3次进入Top20的股票；每次使用账户权益50%，最多持有2只；跌出Top20或盈利30%卖出。", 1, 20, 20, 3, "equal", 1, None, 0.5, 2, 0.30),
     StrategySpec("s13_top1_fallback2_streak3_half", "Top1优先、Top2回退且连续3次Top20，半仓买入", "优先买当日Top1且连续3次进入Top20的股票；无可买Top1时检查Top2；每次使用账户权益50%，最多持有2只；跌出Top20或盈利30%卖出。", 1, 20, 20, 3, "equal", 1, 2, 0.5, 2, 0.30),
+    StrategySpec(
+        "s14_top20_exact2_leader_full", "连续2次Top20领跑者全仓策略",
+        "在恰好连续2次进入Top20的股票中选择当日排名最靠前者全仓买入；下一信号日未完成第3次进入Top20则退出，完成后持有至跌出Top20或盈利32%卖出。",
+        20, 20, 20, 2, "equal", 1, None, None, 1, 0.32, True,
+    ),
 ]
 BASE_STRATEGIES = [spec for spec in STRATEGIES if not spec.strategy_id.endswith("_confirm2") and spec.fixed_take_profit is None]
 
@@ -206,7 +212,11 @@ def run_event_strategy(
         candidates: list[tuple[str, int]] = []
         candidate_rank_limit = spec.fallback_entry_rank or spec.entry_rank
         for code, rank in sorted(ranks.items(), key=lambda item: item[1]):
-            qualified_streak = spec.consecutive_rank is None or streaks.get(code, 0) >= spec.consecutive_days
+            streak = streaks.get(code, 0)
+            qualified_streak = (
+                spec.consecutive_rank is None
+                or (streak == spec.consecutive_days if spec.exact_consecutive_days else streak >= spec.consecutive_days)
+            )
             if not (rank <= candidate_rank_limit and qualified_streak and code not in positions and code not in profit_blocked and code in market.index):
                 continue
             open_price = float(market.at[code, "open"])

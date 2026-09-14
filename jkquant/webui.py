@@ -166,8 +166,11 @@ def _strategy_result_folders() -> list[Path]:
     suite = {
         path.parent for path in (BACKTESTS_ROOT / "strategy_suite").glob("*/*/metrics.json")
     }
+    streak2_leader = {
+        path.parent for path in (BACKTESTS_ROOT / "streak2_leader").glob("*/metrics.json")
+    }
     legacy = {path.parent for path in BACKTESTS_ROOT.glob("*/metrics.json")}
-    return sorted(suite | legacy, reverse=True)
+    return sorted(suite | streak2_leader | legacy, reverse=True)
 
 
 def _result_label(folder: Path) -> str:
@@ -175,6 +178,8 @@ def _result_label(folder: Path) -> str:
     name = metrics.get("strategy_name", folder.name)
     if folder.parent.parent.name == "strategy_suite":
         return f"{name}｜{folder.parent.name}"
+    if folder.parent.name == "streak2_leader":
+        return f"{name}｜{folder.name}"
     return f"旧版单策略｜{folder.name}"
 
 

@@ -66,12 +66,35 @@ def test_consecutive_strategy_waits_for_three_signals() -> None:
 
 def test_active_strategies_are_registered() -> None:
     specs = {spec.strategy_id: spec for spec in STRATEGIES}
-    assert len(specs) == 14
+    assert len(specs) == 15
     assert len(BASE_STRATEGIES) == 5
     assert "s11_top5_streak2_exit10_confirm2" not in specs
     assert specs["s12_top1_streak3_half"].capital_fraction_per_entry == 0.5
     assert specs["s12_top1_streak3_half"].fixed_take_profit == 0.30
     assert specs["s13_top1_fallback2_streak3_half"].fallback_entry_rank == 2
+    assert specs["s14_top20_exact2_leader_full"].exact_consecutive_days
+    assert specs["s14_top20_exact2_leader_full"].fixed_take_profit == 0.32
+
+
+def test_exact_two_day_leader_strategy_buys_only_best_new_streak() -> None:
+    dates = pd.date_range("2025-09-01", periods=5, freq="B")
+    codes = ["000001.SZ", "000002.SZ"]
+    daily = pd.MultiIndex.from_product([dates, codes], names=["trade_date", "ts_code"]).to_frame(index=False)
+    daily[["open", "high", "low", "close", "pre_close"]] = [10.0, 10.1, 9.9, 10.0, 10.0]
+    rankings = pd.DataFrame([
+        {"trade_date": day.date(), "ts_code": code, "rank": rank}
+        for day, day_ranks in zip(dates, [(30, 2), (5, 2), (1, 2), (1, 2), (1, 2)])
+        for code, rank in zip(codes, day_ranks)
+    ])
+    costs = {"commission_buy": 0, "commission_sell": 0, "stamp_tax": 0, "slippage": 0}
+    result, trades, _, metrics = run_event_strategy(
+        daily, rankings, {}, strategy("s14_top20_exact2_leader_full"),
+        dates[2].date(), dates[-1].date(), 1_000_000, costs,
+    )
+    assert trades.iloc[0]["ts_code"] == codes[0]
+    assert trades.iloc[0]["entry_date"] == dates[3].date()
+    assert result.iloc[1]["cash"] == pytest.approx(0)
+    assert metrics["open_positions"] == 1
 
 
 def test_limit_up_blocks_buy() -> None:
