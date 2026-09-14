@@ -26,9 +26,9 @@ from .data.demo_provider import DemoProvider
 from .data.storage import ParquetStore
 from .data.tushare_provider import TushareProvider
 from .data.updater import update_data, update_enriched_data
-from .diagnostics import calculate_factor_diagnostics, write_factor_diagnostics
 from .factors import calculate_factors
 from .report import write_csv
+from .signal_statistics import streak2_leader_continuation
 from .strategy import select_stocks
 
 LOGGER = logging.getLogger(__name__)
@@ -217,6 +217,34 @@ def recommendation_history_stats(
     return stats, {
         "cached_days": len(by_date), "expected_days": len(expected_dates),
     }
+
+
+def top20_streak2_leader_probability(
+    config: dict[str, Any], selected_date: date,
+    start_date: date = RECOMMENDATION_HISTORY_START,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Historical continuation rate for the best-ranked exact two-day Top20 streak."""
+    store = build_store(config)
+    daily = store.load_daily()
+    trading_dates = [
+        pd.Timestamp(value).date() for value in sorted(daily["trade_date"].unique())
+        if start_date <= pd.Timestamp(value).date() <= selected_date
+    ]
+    cache = SelectionCache(store.root / "selection_results.sqlite3")
+    rankings = cache.history(
+        strategy_key(_top50_config(config)), start_date, selected_date,
+    )
+    summary, events = streak2_leader_continuation(rankings, trading_dates, top_n=20)
+    basic = store.load_basic().drop_duplicates("ts_code")
+    names = basic.set_index("ts_code")["name"].fillna("").astype(str).to_dict()
+    candidate = summary.get("current_candidate")
+    if candidate:
+        candidate["name"] = names.get(candidate["ts_code"], "")
+    if not events.empty:
+        events["name"] = events["ts_code"].map(names).fillna("")
+    summary["cached_trading_dates"] = int(rankings["trade_date"].nunique()) if not rankings.empty else 0
+    summary["expected_trading_dates"] = len(trading_dates)
+    return summary, events
 
 
 def best_strategy_recommendations(
@@ -890,35 +918,3 @@ def run_strategy_lab(
         settings, output, benchmark_daily=store.load_market_dataset("benchmark"),
         limit_daily=store.load_market_dataset("limit"),
     )
-
-
-def run_factor_diagnostics(
-    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
-) -> Path:
-    """Evaluate configured factor directions using local point-in-time market data."""
-    store = build_store(config)
-    daily = store.load_daily()
-    if daily.empty:
-        raise RuntimeError("本地没有日线数据，请先运行每日更新")
-    settings = config.get("factor_diagnostics", {})
-    local_end = daily["trade_date"].max().date()
-    effective_end = min(end_date or local_end, local_end)
-    available_dates = sorted(
-        pd.Timestamp(value).date() for value in daily["trade_date"].unique()
-        if pd.Timestamp(value).date() <= effective_end
-    )
-    if not available_dates:
-        raise RuntimeError("诊断结束日期之前没有本地行情")
-    lookback = int(settings.get("lookback_days", 252))
-    configured_start = settings.get("start_date")
-    effective_start = start_date or (
-        date.fromisoformat(configured_start) if configured_start else
-        available_dates[max(0, len(available_dates) - lookback)]
-    )
-    if effective_start >= effective_end:
-        raise ValueError("因子诊断开始日期必须早于结束日期")
-    result = calculate_factor_diagnostics(
-        daily, store.load_basic(), config, effective_start, effective_end,
-    )
-    root = resolve_path(config, settings.get("output_dir", "backtests/factor_diagnostics"))
-    return write_factor_diagnostics(result, root / f"{effective_start}_{effective_end}")

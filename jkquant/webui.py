@@ -14,13 +14,12 @@ import streamlit as st
 from jkquant.ai import get_cached_analysis, run_ai_analysis, test_ai_connection
 from jkquant.config import apply_strategy_profile, load_config
 from jkquant.data.account_store import AccountStore
-from jkquant.factors import FACTOR_COLUMNS
 from jkquant.holiday_risk import holiday_risk
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
     build_store, run_daily,
     combined_signal_recommendations, recommendation_history_stats, selection_for_date,
-    stock_signal_reminders, run_factor_diagnostics,
+    stock_signal_reminders, top20_streak2_leader_probability,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +27,6 @@ REPORTS_ROOT = PROJECT_ROOT / "reports"
 BACKTESTS_ROOT = PROJECT_ROOT / "backtests"
 STRATEGY_LAB_ROOT = BACKTESTS_ROOT / "strategy_lab"
 SIGNAL_ENSEMBLE_ROOT = BACKTESTS_ROOT / "signal_ensemble"
-FACTOR_DIAGNOSTICS_ROOT = BACKTESTS_ROOT / "factor_diagnostics"
 
 
 def _account_store() -> AccountStore:
@@ -170,12 +168,6 @@ def _strategy_result_folders() -> list[Path]:
     }
     legacy = {path.parent for path in BACKTESTS_ROOT.glob("*/metrics.json")}
     return sorted(suite | legacy, reverse=True)
-
-
-def _factor_diagnostic_folders() -> list[Path]:
-    return sorted(
-        {path.parent for path in FACTOR_DIAGNOSTICS_ROOT.glob("*/metadata.json")}, reverse=True,
-    )
 
 
 def _result_label(folder: Path) -> str:
@@ -550,136 +542,6 @@ def render_ai_analysis() -> None:
     _render_ai_result(result)
 
 
-def render_factor_diagnostics() -> None:
-    st.title("因子诊断")
-    st.caption(
-        "检验当前8个量价因子与未来1/5/20个交易日收益的关系。这里用于判断因子是否有效或失效，"
-        "不会改变每日推荐权重。"
-    )
-    config = load_config(PROJECT_ROOT / "config.yaml")
-    action, selector, _ = st.columns([1.5, 2.2, 4.3])
-    if action.button("重新计算诊断", type="primary", use_container_width=True):
-        with st.spinner("正在计算横截面IC、分层收益和因子相关性……"):
-            try:
-                output = run_factor_diagnostics(config)
-                st.success(f"诊断完成：{output.name}")
-            except Exception as exc:
-                st.error(f"诊断失败：{exc}")
-                return
-    folders = _factor_diagnostic_folders()
-    if not folders:
-        st.info("尚无因子诊断结果。点击“重新计算诊断”或运行 python scripts/run_factor_diagnostics.py。")
-        return
-    folder = selector.selectbox("诊断批次", folders, format_func=lambda value: value.name)
-    metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
-    summary = pd.read_csv(folder / "summary.csv")
-    daily_ic = pd.read_csv(folder / "daily_ic.csv", parse_dates=["trade_date"])
-    quantiles = pd.read_csv(folder / "quantiles.csv")
-    correlations = pd.read_csv(folder / "correlations.csv", index_col=0)
-    st.caption(
-        f"区间：{metadata['start_date']} 至 {metadata['end_date']}｜"
-        f"有效样本：{metadata['eligible_rows']:,}｜横截面交易日：{metadata['correlation_dates']}｜"
-        "ST过滤：使用当前简称近似"
-    )
-
-    factor_labels = {key: value.split("（")[0] for key, value in FACTOR_NAMES.items()}
-    longest_horizon = int(summary["horizon"].max())
-    longest = summary[summary["horizon"].eq(longest_horizon)].sort_values(
-        "mean_rank_ic", ascending=False,
-    )
-    best_row = longest.iloc[0]
-    negative_count = int(longest["mean_rank_ic"].lt(0).sum())
-    st.success(
-        f"当前{longest_horizon}日表现最好的方向：{factor_labels.get(best_row['factor'], best_row['factor'])}，"
-        f"平均RankIC {best_row['mean_rank_ic']:.3f}，为正占比 {best_row['positive_rank_ic_rate']:.1%}。"
-    )
-    if negative_count:
-        st.warning(
-            f"{longest_horizon}日周期有 {negative_count}/{len(longest)} 个配置方向的平均RankIC为负。"
-            "这提示当前权重可能需要滚动样本外校准，但本页面不会直接自动改权重。"
-        )
-    display = summary.copy()
-    display["factor"] = display["factor"].map(factor_labels).fillna(display["factor"])
-    display = display.rename(columns={
-        "factor": "因子", "horizon": "未来周期（交易日）", "trading_dates": "有效日期数",
-        "sample_count": "股票样本数", "mean_ic": "平均IC", "mean_rank_ic": "平均RankIC",
-        "rank_ic_std": "RankIC波动", "rank_ic_ir": "RankIC稳定比",
-        "positive_rank_ic_rate": "RankIC为正占比", "bottom_quantile_return": "最低组平均收益",
-        "top_quantile_return": "最高组平均收益", "top_bottom_spread": "多空组收益差",
-    }).sort_values(["未来周期（交易日）", "平均RankIC"], ascending=[True, False])
-    st.subheader("因子有效性总表")
-    st.dataframe(
-        display.style.format({
-            "平均IC": "{:.3f}", "平均RankIC": "{:.3f}", "RankIC波动": "{:.3f}",
-            "RankIC稳定比": "{:.3f}", "RankIC为正占比": "{:.1%}",
-            "最低组平均收益": "{:.2%}", "最高组平均收益": "{:.2%}", "多空组收益差": "{:.2%}",
-        }, na_rep="—"), width="stretch", hide_index=True,
-    )
-
-    horizon_col, factor_col, _ = st.columns([1.2, 2.2, 4.6])
-    horizon = int(horizon_col.selectbox("未来收益周期", sorted(summary["horizon"].unique())))
-    factor = factor_col.selectbox(
-        "查看因子", FACTOR_COLUMNS, format_func=lambda value: factor_labels.get(value, value),
-    )
-    rank_chart_data = summary[summary["horizon"].eq(horizon)].copy()
-    rank_chart_data["因子"] = rank_chart_data["factor"].map(factor_labels)
-    rank_chart = alt.Chart(rank_chart_data).mark_bar().encode(
-        x=alt.X("因子:N", sort="-y", axis=alt.Axis(labelAngle=0, title=None)),
-        y=alt.Y("mean_rank_ic:Q", title="平均RankIC"),
-        color=alt.condition(alt.datum.mean_rank_ic >= 0, alt.value("#d62728"), alt.value("#2ca02c")),
-        tooltip=["因子:N", alt.Tooltip("mean_rank_ic:Q", title="平均RankIC", format=".3f")],
-    ).properties(height=330)
-    st.subheader(f"未来{horizon}日 RankIC 对比")
-    st.altair_chart(rank_chart, width="stretch")
-
-    left, right = st.columns(2)
-    quantile_data = quantiles[
-        quantiles["factor"].eq(factor) & quantiles["horizon"].eq(horizon)
-    ].copy()
-    quantile_data["分组"] = quantile_data["quantile"].map(lambda value: f"Q{int(value)}")
-    quantile_chart = alt.Chart(quantile_data).mark_bar().encode(
-        x=alt.X("分组:N", axis=alt.Axis(labelAngle=0, title="因子从弱到强")),
-        y=alt.Y("mean_forward_return:Q", axis=alt.Axis(format=".1%"), title="未来平均收益"),
-        tooltip=["分组:N", alt.Tooltip("mean_forward_return:Q", format=".2%")],
-    ).properties(height=310, title=f"{factor_labels.get(factor, factor)}分层收益")
-    left.altair_chart(quantile_chart, width="stretch")
-    series = daily_ic[
-        daily_ic["factor"].eq(factor) & daily_ic["horizon"].eq(horizon)
-    ].sort_values("trade_date").copy()
-    series["20日滚动RankIC"] = series["rank_ic"].rolling(20, min_periods=5).mean()
-    line = alt.Chart(series).mark_line().encode(
-        x=alt.X("trade_date:T", axis=alt.Axis(labelAngle=0), title="日期"),
-        y=alt.Y("20日滚动RankIC:Q", title="20日滚动RankIC"),
-        tooltip=[alt.Tooltip("trade_date:T", title="日期"), alt.Tooltip("20日滚动RankIC:Q", format=".3f")],
-    ).properties(height=310, title="近期稳定性")
-    right.altair_chart(line, width="stretch")
-
-    correlation_long = correlations.rename_axis("factor_x").reset_index().melt(
-        "factor_x", var_name="factor_y", value_name="correlation",
-    )
-    correlation_long["因子一"] = correlation_long["factor_x"].map(factor_labels)
-    correlation_long["因子二"] = correlation_long["factor_y"].map(factor_labels)
-    heatmap = alt.Chart(correlation_long).mark_rect().encode(
-        x=alt.X("因子一:N", axis=alt.Axis(labelAngle=0, title=None)),
-        y=alt.Y("因子二:N", axis=alt.Axis(labelAngle=0, title=None)),
-        color=alt.Color("correlation:Q", scale=alt.Scale(domain=[-1, 1], scheme="redblue"), title="相关系数"),
-        tooltip=["因子一:N", "因子二:N", alt.Tooltip("correlation:Q", format=".2f")],
-    ).properties(height=430)
-    st.subheader("因子相关性")
-    st.altair_chart(heatmap, width="stretch")
-    with st.expander("如何判断这些数值"):
-        st.markdown(
-            "- **IC（Information Coefficient，信息系数）**：因子数值与未来收益的相关系数，用来回答‘因子高低是否真的对应后续收益高低’。\n"
-            "- **RankIC**：先把因子和未来收益各自转成排名，再计算IC，因此更关注排序是否正确，且不容易被少数极端值影响。"
-            "这里已按策略方向统一，正数代表当前方向有效；"
-            "绝对值低于0.02通常很弱，0.02～0.05有一定信息，超过0.05值得重点复核，但不是通用保证。\n"
-            "- **RankIC为正占比**：越高越稳定；长期明显高于50%较好，接近50%说明方向不稳定。\n"
-            "- **多空组收益差**：最强Q5组减最弱Q1组；正数说明分层方向正确，越大越好。\n"
-            "- **相关性**：两个因子绝对相关性超过0.7时信息可能高度重复，可考虑降权或去重。\n"
-            "- 所有结果均为历史样本统计；20日未来收益会重叠，不能把显著性和样本量简单等同于独立观测数。"
-        )
-
-
 def render_strategy_overview() -> None:
     st.title("策略总览")
     folders = _suite_folders()
@@ -1045,6 +907,45 @@ def render_signal_alerts() -> None:
     selected_date = available[-1] if available else dates[0]
     if selected_date != requested_date:
         st.info(f"{requested_date} 不是本地交易日，已使用最近交易日 {selected_date}。")
+    continuation, continuation_events = top20_streak2_leader_probability(
+        config, selected_date,
+    )
+    st.subheader("连续两次Top20领跑者的次日延续概率")
+    probability_cols = st.columns(4)
+    win_rate = continuation.get("win_rate")
+    probability_cols[0].metric("历史延续胜率", f"{win_rate:.1%}" if win_rate is not None else "样本不足")
+    probability_cols[1].metric("成功次数", int(continuation.get("successes", 0)))
+    probability_cols[2].metric("历史样本数", int(continuation.get("trials", 0)))
+    current_candidate = continuation.get("current_candidate")
+    probability_cols[3].metric(
+        "当日符合标的",
+        (
+            f"{current_candidate.get('name') or current_candidate['ts_code']}（第{current_candidate['rank']}名）"
+            if current_candidate else "无"
+        ),
+    )
+    st.caption(
+        "统计口径：每天在“截至当天恰好连续2次进入Top20”的股票中，选择当天排名最靠前的一只，"
+        "检查它下一交易日是否仍在Top20；只有已经出现下一交易日的样本才计入胜率。"
+        f"历史范围：{continuation.get('sample_start') or '—'} 至 {continuation.get('sample_end') or '—'}。"
+        "该概率只表示标的次日继续位于Top20，不代表次日上涨或交易盈利。"
+    )
+    if continuation["cached_trading_dates"] < continuation["expected_trading_dates"]:
+        st.warning(
+            f"Top50历史缓存覆盖 {continuation['cached_trading_dates']}/"
+            f"{continuation['expected_trading_dates']} 个交易日，当前概率只基于完整可识别样本。"
+        )
+    if not continuation_events.empty:
+        with st.expander("查看最近20次历史样本"):
+            history_display = continuation_events.tail(20).sort_values("signal_date", ascending=False).rename(columns={
+                "signal_date": "连续2次确认日", "next_trade_date": "下一交易日",
+                "ts_code": "股票代码", "name": "证券简称", "signal_rank": "确认日排名",
+                "next_rank": "次日排名", "success": "是否延续至第3次",
+            })
+            history_display["是否延续至第3次"] = history_display["是否延续至第3次"].map(
+                {True: "成功", False: "失败"},
+            )
+            st.dataframe(history_display, width="stretch", hide_index=True)
     with st.spinner("正在计算八策略联合信号……"):
         joint, metadata = combined_signal_recommendations(config, selected_date)
     definitions = pd.DataFrame(metadata.get("strategies", []))
@@ -1379,8 +1280,7 @@ def render_system_help() -> None:
         "4. **过滤股票**：排除当前 ST、成交额不足、零成交和历史记录太短的股票。\n"
         "5. **横截面打分**：把当日每个因子转成 0～1 的市场百分位得分。\n"
         "6. **生成候选**：按综合得分从高到低输出 Top-K，供人工继续研究。\n"
-        "7. **诊断因子**：检查各因子与未来1/5/20日收益的RankIC、分层收益、稳定性和重复度。\n"
-        "8. **历史回测**：使用前一交易日信号，在下一交易日执行；佣金万分之五且每笔最低5元，卖出另计印花税，并计入滑点。"
+        "7. **历史回测**：使用前一交易日信号，在下一交易日执行；佣金万分之五且每笔最低5元，卖出另计印花税，并计入滑点。"
     )
     st.subheader("当前量价策略")
     st.markdown(
@@ -1419,7 +1319,6 @@ def main() -> None:
     navigation = st.navigation([
         st.Page(render_topk, title="每日候选", icon="📋", url_path="candidates", default=True),
         st.Page(render_ai_analysis, title="AI分析", icon="🤖", url_path="ai-analysis"),
-        st.Page(render_factor_diagnostics, title="因子诊断", icon="🔬", url_path="factor-diagnostics"),
         st.Page(render_signal_alerts, title="交易信号提醒", icon="🔔", url_path="signals"),
         st.Page(render_account, title="账户", icon="💼", url_path="account"),
         st.Page(render_strategy_overview, title="策略总览", icon="📊", url_path="strategies"),
