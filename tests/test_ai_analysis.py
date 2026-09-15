@@ -7,6 +7,7 @@ from pathlib import Path
 from jkquant.ai.cache import AIAnalysisCache
 from jkquant.ai.deepseek import DeepSeekClient
 from jkquant.ai.prompts import SYSTEM_PROMPT, user_prompt
+from jkquant.ai.service import run_ai_analysis
 
 
 def _analysis() -> dict:
@@ -87,3 +88,48 @@ def test_deepseek_connection_check_does_not_generate_tokens(monkeypatch) -> None
     result = DeepSeekClient({"model": "deepseek-v4-flash"}).test_connection()
     assert result["connected"] is True
     assert result["models"] == ["deepseek-flash", "deepseek-v4-pro"]
+
+
+def test_service_passes_selected_model_and_custom_question(monkeypatch, tmp_path: Path) -> None:
+    captured = {}
+
+    class Cache:
+        def get(self, *args):
+            return None
+
+        def put(self, selected_date, provider, model, version, input_hash, analysis, context, usage):
+            captured.update({"model": model, "context": context})
+            return {"analysis": analysis, "model": model, "cached": False}
+
+    class Client:
+        def __init__(self, settings):
+            captured["client_model"] = settings["model"]
+
+        def complete(self, system, prompt, temperature, max_tokens):
+            captured["prompt"] = prompt
+            analysis = _analysis()
+            analysis["user_question_answer"] = {
+                "question": "哪些波动较低？", "answer": "测试回答",
+                "supporting_data": [], "limitations": [],
+            }
+            return analysis, {}
+
+    monkeypatch.setattr("jkquant.ai.service.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("jkquant.ai.service.build_analysis_context", lambda *args: {
+        "analysis_date": "2026-09-10", "candidates": [],
+    })
+    monkeypatch.setattr("jkquant.ai.service._cache", lambda config: Cache())
+    monkeypatch.setattr("jkquant.ai.service.DeepSeekClient", Client)
+    config = {
+        "_config_dir": str(tmp_path),
+        "ai": {"provider": "deepseek", "model": "deepseek-flash",
+               "models": ["deepseek-flash", "deepseek-v4-pro"]},
+    }
+    run_ai_analysis(
+        config, date(2026, 9, 10), model="deepseek-v4-pro",
+        user_question="  哪些波动较低？  ",
+    )
+    assert captured["client_model"] == "deepseek-v4-pro"
+    assert captured["model"] == "deepseek-v4-pro"
+    assert captured["context"]["user_question"] == "哪些波动较低？"
+    assert "哪些波动较低" in captured["prompt"]
