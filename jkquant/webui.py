@@ -169,8 +169,21 @@ def _strategy_result_folders() -> list[Path]:
     streak2_leader = {
         path.parent for path in (BACKTESTS_ROOT / "streak2_leader").glob("*/metrics.json")
     }
+    research_indexes = sorted(
+        (BACKTESTS_ROOT / "strategy_research").glob("*/research.json"),
+        key=lambda path: path.stat().st_mtime, reverse=True,
+    )
+    latest_research = research_indexes[0].parent if research_indexes else None
+    research = {
+        latest_research / period for period in ("year", "quarter", "month")
+        if latest_research is not None and (latest_research / period / "metrics.json").exists()
+    }
     legacy = {path.parent for path in BACKTESTS_ROOT.glob("*/metrics.json")}
-    return sorted(suite | streak2_leader | legacy, reverse=True)
+    return sorted(
+        suite | streak2_leader | research | legacy,
+        key=lambda folder: (folder / "metrics.json").stat().st_mtime,
+        reverse=True,
+    )
 
 
 def _result_label(folder: Path) -> str:
@@ -180,6 +193,9 @@ def _result_label(folder: Path) -> str:
         return f"{name}｜{folder.parent.name}"
     if folder.parent.name == "streak2_leader":
         return f"{name}｜{folder.name}"
+    if folder.parent.parent.name == "strategy_research":
+        period = metrics.get("research_period", folder.name)
+        return f"研究方案｜{period}｜{name}｜{folder.parent.name}"
     return f"旧版单策略｜{folder.name}"
 
 

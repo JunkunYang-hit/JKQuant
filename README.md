@@ -64,6 +64,8 @@ JKQuant/
 │   ├── run_strategy_lab.py     # 运行最佳策略的多参数消融试验，支持断点续跑
 │   ├── run_signal_ensemble.py  # 将八策略按等资金子账户回测最近若干月
 │   ├── run_streak2_leader_backtest.py # 回测连续2次Top20领跑者全仓策略
+│   ├── run_strategy_research.py # 较早训练期选权重，再验证近一年/三月/一月
+│   ├── audit_strategy_evidence.py # 离线审计行情质量与已有回测证据
 │   ├── run_ai_analysis.py      # 命令行生成/读取指定日期的DeepSeek分析
 │   └── run_webui.py            # 启动本地 WebUI 并自动打开浏览器
 ├── tests/                      # 因子无未来数据、完整流程和回测测试
@@ -311,6 +313,16 @@ python scripts/run_streak2_leader_backtest.py
 ```
 
 结果分别写入 `backtests/streak2_leader/开始日期_结束日期/`，并计入万分之五且最低5元佣金、卖出印花税、滑点以及开盘涨跌停约束。
+
+较稳健策略研究不再从数百个参数中直接挑全区间冠军。它先在近一年开始之前的历史区间比较四组预先定义的低波、价值、中期动量和流动性权重，再冻结所选权重，分别从现金起跑验证近一年、近三个月和近一个月：
+
+```powershell
+python scripts/run_strategy_research.py
+```
+
+策略限定沪深主板、正PE与合理PB、上市和流动性门槛；最多持有10只，每个行业最多2只，单股买入上限10%，目标仓位80%。每5个交易日补仓，Top20进入、连续两次跌出Top40退出，并使用收盘8%止损和12%移动止盈。研究引擎按前一交易日信号在次日开盘执行、使用100股整数手、遵守T+1及开盘涨跌停限制，并用前收口径近似处理除权权益变化。该近似包含分红再投资假设，不能代替完整的公司行为账本。
+
+详细的数据和旧回测审计见 `docs/strategy_evidence_audit.md`。当前验证仍属于回顾性时间分离；这些日期已在此前策略研究中反复查看，不能宣称为完全未见的独立样本外结果。
 
 ## 当前边界
 
