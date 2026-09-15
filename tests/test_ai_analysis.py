@@ -14,6 +14,9 @@ def _analysis() -> dict:
         "analysis_date": "2026-09-10", "overall_risk_level": "中",
         "market_summary": "测试", "portfolio_observations": [],
         "concentration_risks": [], "candidates": [], "data_limitations": [],
+        "user_question_answer": {
+            "question": "", "answer": "", "supporting_data": [], "limitations": [],
+        },
         "disclaimer": "仅供量化研究参考，不构成投资建议。",
     }
 
@@ -33,10 +36,11 @@ def test_ai_cache_round_trip(tmp_path: Path) -> None:
 
 
 def test_prompt_requires_json_and_rejects_fabricated_news() -> None:
-    prompt = user_prompt({"analysis_date": "2026-09-10", "candidates": []})
+    prompt = user_prompt({"analysis_date": "2026-09-10", "candidates": [], "user_question": "谁的风险较低？"})
     assert "json" in SYSTEM_PROMPT.lower()
     assert "严禁编造" in SYSTEM_PROMPT
     assert "INPUT_DATA=" in prompt
+    assert "谁的风险较低" in prompt
 
 
 def test_deepseek_client_uses_json_mode(monkeypatch) -> None:

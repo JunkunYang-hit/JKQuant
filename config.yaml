@@ -107,7 +107,8 @@ ai:
   provider: deepseek
   api_key_env: DEEPSEEK_API_KEY
   base_url: https://api.deepseek.com
-  model: deepseek-v4-flash
+  model: deepseek-flash
+  models: [deepseek-flash, deepseek-v4-pro]
   thinking: disabled  # Top-20结构化复核关闭思考模式，避免推理占满输出额度
   temperature: 0.2
   max_tokens: 16000  # 需要容纳20只股票的完整结构化JSON

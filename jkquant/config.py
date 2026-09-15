@@ -64,6 +64,11 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError("ai.max_tokens 必须大于 0")
         if int(ai.get("timeout_seconds", 180)) <= 0:
             raise ValueError("ai.timeout_seconds 必须大于 0")
+        models = [str(value) for value in ai.get("models", [ai.get("model", "deepseek-flash")])]
+        if not models or any(not value.strip() for value in models):
+            raise ValueError("ai.models 必须是非空模型名列表")
+        if str(ai.get("model", "deepseek-flash")) not in models:
+            raise ValueError("ai.model 必须包含在 ai.models 中")
 
 
 def resolve_path(config: dict[str, Any], value: str) -> Path:

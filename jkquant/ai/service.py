@@ -174,16 +174,32 @@ def test_ai_connection(config: dict[str, Any]) -> dict[str, Any]:
     return DeepSeekClient(config.get("ai", {})).test_connection()
 
 
-def run_ai_analysis(config: dict[str, Any], selected_date: date, force: bool = False) -> dict[str, Any]:
+def run_ai_analysis(
+    config: dict[str, Any], selected_date: date, force: bool = False,
+    model: str | None = None, user_question: str = "",
+) -> dict[str, Any]:
     load_dotenv(resolve_path(config, ".env"), override=True)
-    settings = config.get("ai", {})
+    settings = dict(config.get("ai", {}))
     provider = str(settings.get("provider", "deepseek"))
     if provider != "deepseek":
         raise ValueError(f"暂不支持AI供应商：{provider}")
     context = build_analysis_context(config, selected_date)
+    question = " ".join(str(user_question).strip().split())
+    if len(question) > 2000:
+        raise ValueError("自定义问题最多2000个字符")
+    context["user_question"] = question
+    if model:
+        allowed = {
+            str(item) for item in settings.get(
+                "models", ["deepseek-flash", "deepseek-v4-pro"],
+            )
+        }
+        if model not in allowed:
+            raise ValueError(f"未配置的DeepSeek模型：{model}")
+        settings["model"] = model
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     input_hash = hashlib.sha256(encoded).hexdigest()
-    model = str(settings.get("model", "deepseek-v4-flash"))
+    model = str(settings.get("model", "deepseek-flash"))
     cache = _cache(config)
     if not force:
         cached = cache.get(selected_date, provider, model, PROMPT_VERSION, input_hash)

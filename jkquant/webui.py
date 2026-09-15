@@ -440,6 +440,20 @@ def _render_ai_result(result: dict) -> None:
         st.success(f"整体风险：{risk}")
     st.subheader("市场与候选组合摘要")
     st.write(analysis.get("market_summary", "暂无摘要"))
+    question_answer = analysis.get("user_question_answer", {})
+    if question_answer.get("question"):
+        st.subheader("AI对你的问题的回答")
+        st.markdown(f"**你的问题：** {question_answer.get('question')}")
+        st.write(question_answer.get("answer", "暂无回答"))
+        support, limits = st.columns(2)
+        with support:
+            st.markdown("**回答依据**")
+            for item in question_answer.get("supporting_data", []):
+                st.markdown(f"- {item}")
+        with limits:
+            st.markdown("**回答边界**")
+            for item in question_answer.get("limitations", []):
+                st.markdown(f"- {item}")
     left, right = st.columns(2)
     with left:
         st.markdown("**组合观察**")
@@ -505,13 +519,28 @@ def render_ai_analysis() -> None:
     if not dates:
         st.info("尚无本地候选数据，请先在“每日候选”更新数据并计算推荐。")
         return
-    date_col, force_col, check_col, action_col, _ = st.columns([1.5, 1.35, 1.1, 1.5, 3.55])
+    model_labels = {
+        "deepseek-flash": "DeepSeek V4.1 Flash（推荐，速度快）",
+        "deepseek-v4-pro": "DeepSeek V4 Pro（兼容入口）",
+    }
+    configured_models = [
+        str(value) for value in config.get("ai", {}).get(
+            "models", ["deepseek-flash", "deepseek-v4-pro"],
+        )
+    ]
+    default_model = str(config.get("ai", {}).get("model", configured_models[0]))
+    date_col, model_col, force_col, check_col, action_col, _ = st.columns([1.4, 2.2, 1.35, 1.1, 1.5, 2.45])
     requested_date = date_col.date_input(
         "分析日期", value=date.today(), min_value=dates[0],
         max_value=max(date.today(), dates[-1]), format="YYYY-MM-DD", key="ai_analysis_date",
     )
     eligible = [value for value in dates if value <= requested_date]
     selected_date = eligible[-1] if eligible else dates[0]
+    model_index = configured_models.index(default_model) if default_model in configured_models else 0
+    selected_model = model_col.selectbox(
+        "分析模型", configured_models, index=model_index,
+        format_func=lambda value: model_labels.get(value, value),
+    )
     force = force_col.toggle(
         "忽略缓存重新生成", value=False,
         help="开启后会再次调用DeepSeek并产生新的Token费用。",
@@ -523,6 +552,17 @@ def render_ai_analysis() -> None:
         except Exception as exc:
             st.error(f"连接失败：{exc}")
     generate = action_col.button("生成AI分析", type="primary", use_container_width=True)
+    user_question = st.text_area(
+        "想让AI额外回答的问题（可选）",
+        placeholder="例如：这20只股票中，哪些估值和波动相对均衡？请说明数据依据。",
+        max_chars=2000,
+        help="问题会和当日Top20的本地量价、估值、财务及宏观数据一起发送，并单独展示回答。",
+    )
+    if selected_model == "deepseek-v4-pro":
+        st.caption(
+            "官方当前仍接受 deepseek-v4-pro，但自2026-09-14起暂时路由到V4.1 Flash；"
+            "待独立Pro重新上线后，界面无需改代码即可继续使用该模型名。"
+        )
     if selected_date != requested_date:
         st.info(f"{requested_date} 不是本地交易日，已切换到 {selected_date}。")
 
@@ -530,7 +570,10 @@ def render_ai_analysis() -> None:
     if generate:
         with st.spinner("正在整理Top-20和时点数据，并请求DeepSeek分析……"):
             try:
-                result = run_ai_analysis(config, selected_date, force=force)
+                result = run_ai_analysis(
+                    config, selected_date, force=force,
+                    model=selected_model, user_question=user_question,
+                )
                 if result.get("cached"):
                     st.success("输入数据没有变化，已直接读取本地AI分析缓存。")
                 else:
@@ -1221,58 +1264,103 @@ def render_account() -> None:
             st.rerun()
 
 
-def render_data_center() -> None:
-    st.title("数据中心")
-    st.caption("展示本机已经落盘的数据；财务三表与宏观数据暂不直接改变现有量价评分。")
+def render_strategy_hub() -> None:
+    section = st.sidebar.radio(
+        "策略研究分类", ["策略总览", "策略分析", "策略试验场"],
+        help="三个分类共用同一个网址，切换时只加载当前分类。",
+    )
+    if section == "策略总览":
+        render_strategy_overview()
+    elif section == "策略分析":
+        render_backtest()
+    else:
+        render_strategy_lab()
+
+
+def render_market_overview() -> None:
+    st.title("市场概览")
+    st.caption("把本地行情整理成日常阅读信息，用来判断当日市场强弱、成交活跃度和行业分布。")
     config = load_config(PROJECT_ROOT / "config.yaml")
     store = build_store(config)
-    rows = []
-    for label, name in (
-        ("A股日线", "daily"), ("A股周线", "weekly"), ("A股月线", "monthly"),
-        ("每日估值指标", "daily_basic"), ("每日涨跌停价", "limit"),
-        ("沪深300ETF（510300）", "benchmark"),
-    ):
-        frame = store.load_daily() if name == "daily" else store.load_market_dataset(name)
-        rows.append({
-            "数据集": label, "记录数": len(frame),
-            "最早日期": frame["trade_date"].min().date() if not frame.empty else "—",
-            "最新日期": frame["trade_date"].max().date() if not frame.empty else "—",
-        })
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-    macro_rows = []
-    for endpoint, label in (("cn_gdp", "GDP"), ("cn_cpi", "CPI"), ("cn_ppi", "PPI"), ("cn_m", "货币供应"), ("cn_pmi", "PMI"), ("sf_month", "社会融资")):
-        frame = store.load_macro(endpoint)
-        macro_rows.append({"宏观数据": label, "接口": endpoint, "记录数": len(frame)})
-    st.subheader("宏观经济")
-    st.dataframe(pd.DataFrame(macro_rows), width="stretch", hide_index=True)
-    progress_path = store.fundamental_dir / "progress.json"
-    completed_files = {
-        statement: len(list((store.fundamental_dir / statement).glob("*.parquet")))
-        for statement in ("income", "balancesheet", "cashflow")
-    }
-    st.subheader("财务三表")
-    st.write({"利润表股票数": completed_files["income"], "资产负债表股票数": completed_files["balancesheet"], "现金流量表股票数": completed_files["cashflow"]})
-    if progress_path.exists():
-        progress = json.loads(progress_path.read_text(encoding="utf-8"))
-        st.progress(min((progress.get("completed", 0) + progress.get("skipped", 0)) / max(progress.get("total_tasks", 1), 1), 1.0))
-        st.caption(f"状态：{progress.get('status')}｜当前股票：{progress.get('current_stock')}｜失败：{progress.get('failed', 0)}｜更新时间：{progress.get('updated_at')}")
+    daily = store.load_daily()
+    if daily.empty:
+        st.info("尚无本地行情，请先在每日候选页更新数据。")
+        return
+    dates = [pd.Timestamp(value).date() for value in sorted(daily["trade_date"].unique())]
+    control, _ = st.columns([1.6, 6.4])
+    requested = control.date_input(
+        "查看日期", value=dates[-1], min_value=dates[0], max_value=dates[-1],
+        format="YYYY-MM-DD", key="market_overview_date",
+    )
+    selected = max(value for value in dates if value <= requested)
+    day = daily[daily["trade_date"].eq(pd.Timestamp(selected))].copy()
+    day["pct_chg"] = pd.to_numeric(day["pct_chg"], errors="coerce") / 100
+    advances = int(day["pct_chg"].gt(0).sum())
+    declines = int(day["pct_chg"].lt(0).sum())
+    flats = int(day["pct_chg"].eq(0).sum())
+    limits = store.load_market_dataset("limit")
+    if not limits.empty:
+        limit_day = limits[limits["trade_date"].eq(pd.Timestamp(selected))]
+        day = day.merge(
+            limit_day[["ts_code", "up_limit", "down_limit"]], on="ts_code", how="left",
+        )
+        limit_up = int(day["close"].ge(day["up_limit"] - .005).sum())
+        limit_down = int(day["close"].le(day["down_limit"] + .005).sum())
     else:
-        st.info("尚未启动财务三表补库。运行：python scripts/update_fundamentals.py")
+        limit_up = limit_down = 0
+    total_amount_trillion = float(day["amount"].sum()) / 1_000_000_000
+    metrics = st.columns(6)
+    metrics[0].metric("上涨家数", advances)
+    metrics[1].metric("下跌家数", declines)
+    metrics[2].metric("平盘家数", flats)
+    metrics[3].metric("涨停 / 跌停", f"{limit_up} / {limit_down}")
+    metrics[4].metric("涨跌幅中位数", f"{day['pct_chg'].median():.2%}")
+    metrics[5].metric("全市场成交额", f"{total_amount_trillion:.2f} 万亿元")
+
+    valuation = store.load_market_dataset("daily_basic")
+    valuation_day = valuation[valuation["trade_date"].eq(pd.Timestamp(selected))].copy()
+    benchmark = store.load_market_dataset("benchmark")
+    benchmark_window = benchmark[benchmark["trade_date"].le(pd.Timestamp(selected))].sort_values("trade_date").tail(21)
+    benchmark_return = (
+        float(benchmark_window["close"].iloc[-1] / benchmark_window["close"].iloc[0] - 1)
+        if len(benchmark_window) > 1 else None
+    )
+    secondary = st.columns(4)
+    pe = pd.to_numeric(valuation_day.get("pe_ttm"), errors="coerce")
+    pb = pd.to_numeric(valuation_day.get("pb"), errors="coerce")
+    secondary[0].metric("沪深300ETF近20日", f"{benchmark_return:.2%}" if benchmark_return is not None else "—")
+    secondary[1].metric("上涨股票占比", f"{advances / max(len(day), 1):.1%}")
+    secondary[2].metric("盈利股票PE中位数", f"{pe[pe.gt(0)].median():.1f}" if pe.notna().any() else "—")
+    secondary[3].metric("PB中位数", f"{pb[pb.gt(0)].median():.2f}" if pb.notna().any() else "—")
+
+    left, right = st.columns([1.15, .85])
+    distribution = day[day["pct_chg"].between(-.12, .12)].copy()
+    chart = alt.Chart(distribution).mark_bar().encode(
+        x=alt.X("pct_chg:Q", bin=alt.Bin(maxbins=40), axis=alt.Axis(format=".0%", labelAngle=0), title="当日涨跌幅"),
+        y=alt.Y("count():Q", title="股票数量"),
+        color=alt.condition(alt.datum.pct_chg >= 0, alt.value("#d62728"), alt.value("#2ca02c")),
+    ).properties(height=350, title="市场涨跌分布")
+    left.altair_chart(chart, width="stretch")
     basic = store.load_basic()
-    available = sorted({path.stem.replace("_", ".") for path in store.fundamental_dir.glob("*/*.parquet")})
-    if available:
-        names = basic.drop_duplicates("ts_code").set_index("ts_code")["name"].to_dict()
-        spellings = (
-            basic.drop_duplicates("ts_code").set_index("ts_code")["cnspell"].fillna("").to_dict()
-            if "cnspell" in basic else {}
-        )
-        code = _stock_search(
-            "查看单只股票财务报表", available, names, spellings, "financial_stock",
-        )
-        for statement, label in (("income", "利润表"), ("balancesheet", "资产负债表"), ("cashflow", "现金流量表")):
-            with st.expander(label):
-                frame = store.load_fundamental(statement, code).sort_values("end_date", ascending=False)
-                st.dataframe(frame.head(12), width="stretch", hide_index=True)
+    industry = day.merge(
+        basic[["ts_code", "industry"]].drop_duplicates("ts_code"), on="ts_code", how="left",
+    )
+    industry["industry"] = industry["industry"].fillna("未分类")
+    industry_table = industry.groupby("industry").agg(
+        股票数=("ts_code", "size"), 上涨占比=("pct_chg", lambda values: float(values.gt(0).mean())),
+        涨跌幅中位数=("pct_chg", "median"), 成交额=("amount", "sum"),
+    ).reset_index().rename(columns={"industry": "行业"})
+    industry_table["成交额（亿元）"] = industry_table.pop("成交额") / 100_000
+    industry_table = industry_table[industry_table["股票数"].ge(5)].sort_values("涨跌幅中位数", ascending=False)
+    right.dataframe(
+        industry_table.head(15).style.format({
+            "上涨占比": "{:.1%}", "涨跌幅中位数": "{:.2%}", "成交额（亿元）": "{:.1f}",
+        }), width="stretch", hide_index=True, height=385,
+    )
+    st.caption(
+        f"行情日期：{selected}。行业采用当前基础信息，只用于阅读当日分布；PE只统计正值，"
+        "沪深300ETF近20日为价格收益。"
+    )
 
 
 def render_system_help() -> None:
@@ -1326,10 +1414,8 @@ def main() -> None:
         st.Page(render_ai_analysis, title="AI分析", icon="🤖", url_path="ai-analysis"),
         st.Page(render_signal_alerts, title="交易信号提醒", icon="🔔", url_path="signals"),
         st.Page(render_account, title="账户", icon="💼", url_path="account"),
-        st.Page(render_strategy_overview, title="策略总览", icon="📊", url_path="strategies"),
-        st.Page(render_backtest, title="策略分析", icon="📈", url_path="backtest"),
-        st.Page(render_strategy_lab, title="策略试验场", icon="🧪", url_path="strategy-lab"),
-        st.Page(render_data_center, title="数据中心", icon="🗄️", url_path="data"),
+        st.Page(render_strategy_hub, title="策略研究", icon="📊", url_path="strategy-research"),
+        st.Page(render_market_overview, title="市场概览", icon="🌐", url_path="market"),
         st.Page(render_system_help, title="系统说明", icon="ℹ️", url_path="help"),
     ], position="top")
     st.divider()

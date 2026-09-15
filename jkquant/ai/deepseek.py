@@ -20,7 +20,7 @@ class DeepSeekClient:
                 f"未配置 {config.get('api_key_env', 'DEEPSEEK_API_KEY')}，请写入项目根目录 .env"
             )
         self.base_url = str(config.get("base_url", "https://api.deepseek.com")).rstrip("/")
-        self.model = str(config.get("model", "deepseek-v4-flash"))
+        self.model = str(config.get("model", "deepseek-flash"))
         self.thinking = str(config.get("thinking", "disabled"))
         if self.thinking not in {"enabled", "disabled"}:
             raise DeepSeekError("ai.thinking 仅支持 enabled 或 disabled")
@@ -108,9 +108,12 @@ class DeepSeekClient:
     def _validate(result: dict[str, Any]) -> None:
         required = {
             "analysis_date", "overall_risk_level", "market_summary", "candidates",
-            "portfolio_observations", "concentration_risks", "data_limitations", "disclaimer",
+            "portfolio_observations", "concentration_risks", "user_question_answer",
+            "data_limitations", "disclaimer",
         }
         if not isinstance(result, dict) or not required.issubset(result):
             raise DeepSeekError("DeepSeek 返回的JSON缺少必要字段")
         if not isinstance(result["candidates"], list):
             raise DeepSeekError("DeepSeek 返回的候选明细格式不正确")
+        if not isinstance(result["user_question_answer"], dict):
+            raise DeepSeekError("DeepSeek 返回的自定义问题回答格式不正确")
