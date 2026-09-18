@@ -22,6 +22,8 @@ data:
 market:
   universe: all_a
   exclude_st: true  # 使用 Tushare 当前简称过滤；历史时点 ST 仍需专门数据还原
+  exclude_star_market: true  # 科创板需单独交易权限：不纳入推荐、信号或新回测
+  exclude_chinext_market: true  # 创业板也需单独交易权限；当前账户不可买入
   min_list_days: 120
   min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
 

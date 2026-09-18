@@ -64,6 +64,27 @@ def test_consecutive_strategy_waits_for_three_signals() -> None:
     assert metrics["open_positions"] == 1
 
 
+def test_ex_right_proxy_does_not_turn_split_into_a_loss() -> None:
+    dates = pd.bdate_range("2025-09-01", periods=4)
+    daily = pd.DataFrame({
+        "trade_date": dates, "ts_code": "000001.SZ",
+        "open": [10., 10., 5., 5.], "high": [10., 10., 5., 5.],
+        "low": [10., 10., 5., 5.], "close": [10., 10., 5., 5.],
+        "pre_close": [10., 10., 5., 5.],
+    })
+    rankings = pd.DataFrame({"trade_date": [value.date() for value in dates],
+                             "rank": 1, "ts_code": "000001.SZ"})
+    costs = {"commission_buy": 0, "commission_sell": 0, "stamp_tax": 0, "slippage": 0}
+    result, trades, _, metrics = run_event_strategy(
+        daily, rankings, {}, strategy("s01_top10_exit20"), dates[0].date(), dates[-1].date(),
+        1_000_000, costs, take_profit=None, record_profit=None,
+    )
+    assert result.iloc[-1]["equity_value"] == pytest.approx(1_000_000)
+    assert trades.iloc[0]["entry_price_unadjusted"] == 10
+    assert trades.iloc[0]["entry_price"] == 5
+    assert metrics["corporate_action_adjustment_count"] == 1
+
+
 def test_active_strategies_are_registered() -> None:
     specs = {spec.strategy_id: spec for spec in STRATEGIES}
     assert len(specs) == 15

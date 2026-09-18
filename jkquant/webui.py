@@ -14,19 +14,21 @@ import streamlit as st
 from jkquant.ai import get_cached_analysis, run_ai_analysis, test_ai_connection
 from jkquant.config import apply_strategy_profile, load_config
 from jkquant.data.account_store import AccountStore
+from jkquant.data.selection_cache import strategy_key
 from jkquant.holiday_risk import holiday_risk
+from jkquant.limit_up import build_board_history, promotion_candidates, promotion_summary
 from jkquant.pipeline import (
     RECOMMENDATION_HISTORY_START, available_selection_dates,
     build_store, run_daily,
     combined_signal_recommendations, recommendation_history_stats, selection_for_date,
     stock_signal_reminders, top20_streak2_leader_probability,
 )
+from jkquant.strategy import is_chinext_market, is_star_market
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_ROOT = PROJECT_ROOT / "reports"
 BACKTESTS_ROOT = PROJECT_ROOT / "backtests"
 STRATEGY_LAB_ROOT = BACKTESTS_ROOT / "strategy_lab"
-SIGNAL_ENSEMBLE_ROOT = BACKTESTS_ROOT / "signal_ensemble"
 
 
 def _account_store() -> AccountStore:
@@ -163,27 +165,21 @@ def _suite_folders() -> list[Path]:
 
 
 def _strategy_result_folders() -> list[Path]:
-    suite = {
-        path.parent for path in (BACKTESTS_ROOT / "strategy_suite").glob("*/*/metrics.json")
-    }
-    streak2_leader = {
-        path.parent for path in (BACKTESTS_ROOT / "streak2_leader").glob("*/metrics.json")
-    }
-    research_indexes = sorted(
-        (BACKTESTS_ROOT / "strategy_research").glob("*/research.json"),
-        key=lambda path: path.stat().st_mtime, reverse=True,
+    batches = _suite_folders()
+    if not batches:
+        return []
+    folders = sorted(
+        {path.parent for path in batches[0].glob("*/metrics.json")},
+        key=lambda folder: (folder / "metrics.json").stat().st_mtime, reverse=True,
     )
-    latest_research = research_indexes[0].parent if research_indexes else None
-    research = {
-        latest_research / period for period in ("year", "quarter", "month")
-        if latest_research is not None and (latest_research / period / "metrics.json").exists()
-    }
-    legacy = {path.parent for path in BACKTESTS_ROOT.glob("*/metrics.json")}
-    return sorted(
-        suite | streak2_leader | research | legacy,
-        key=lambda folder: (folder / "metrics.json").stat().st_mtime,
-        reverse=True,
-    )
+    return [folder for folder in folders if _positive_result(folder / "metrics.json")]
+
+
+def _positive_result(path: Path) -> bool:
+    try:
+        return float(json.loads(path.read_text(encoding="utf-8")).get("cumulative_return", 0)) > 0
+    except (ValueError, OSError, TypeError):
+        return False
 
 
 def _result_label(folder: Path) -> str:
@@ -262,6 +258,13 @@ def _recommendation_table(
 
 def render_topk() -> None:
     st.title("每日候选（Top-K）")
+    recent_suites = _suite_folders()
+    if recent_suites:
+        recent_suite = json.loads((recent_suites[0] / "suite.json").read_text(encoding="utf-8"))
+        evaluated = recent_suite.get("strategies", [])
+        if evaluated and not any(float(item["metrics"].get("cumulative_return", 0)) > 0 for item in evaluated):
+            st.warning(f"最新可交易股票池回测中，{len(evaluated)} 套主策略累计收益均未转正。"
+                       "下方 Top-K 是量价观察名单，不是已经验证可盈利的买入指令。")
     show_holiday_hint = st.toggle("显示节假日前风险提示", value=True)
     if show_holiday_hint:
         holiday_status = holiday_risk(date.today())
@@ -608,7 +611,7 @@ def render_ai_analysis() -> None:
 
 def render_strategy_overview() -> None:
     st.title("策略总览")
-    folders = _suite_folders()
+    folders = _suite_folders()[:1]
     if not folders:
         st.info("尚无多策略结果。请运行：python scripts/run_strategy_suite.py")
         return
@@ -624,8 +627,14 @@ def render_strategy_overview() -> None:
         f"ST 过滤：按当前简称近似排除 {suite.get('st_filter', {}).get('excluded_count', 0)} 只。"
         "历史回测仍使用当前简称近似过滤 ST，后续应接入历史风险警示时点数据。"
     )
+    visible_strategies = [item for item in suite["strategies"]
+                          if float(item["metrics"].get("cumulative_return", 0)) > 0]
+    st.caption(f"仅显示该批次累计收益大于 0 的 {len(visible_strategies)} 套策略；亏损结果保留在本地审计文件。")
+    if not visible_strategies:
+        st.info("该批次没有累计收益为正的策略。")
+        return
     records = []
-    for strategy in suite["strategies"]:
+    for strategy in visible_strategies:
         metrics = strategy["metrics"]
         records.append({
             "策略": strategy["name"], "累计收益": metrics["cumulative_return"],
@@ -663,59 +672,19 @@ def render_strategy_overview() -> None:
     sweep_path = folder / suite.get("take_profit_sweep_file", "take_profit_sweep.csv")
     if sweep_path.exists():
         sweep = pd.read_csv(sweep_path)
-        st.subheader("止盈阈值对照（保留的原始策略）")
-        st.caption("用于隔离止盈阈值影响；两日确认和固定30%止盈版本不参与该表，避免同时改变多个变量。‘不设止盈’是对照组。")
-        threshold_summary = pd.DataFrame(suite.get("take_profit_sweep_summary", [])).rename(columns={
-            "threshold": "止盈阈值", "mean_cumulative_return": "平均累计收益",
-            "median_cumulative_return": "累计收益中位数", "positive_strategy_count": "盈利策略数",
-            "mean_max_drawdown": "平均最大回撤",
-        })
-        if not threshold_summary.empty:
-            st.dataframe(
-                threshold_summary.style.format({
-                    "平均累计收益": "{:.2%}", "累计收益中位数": "{:.2%}", "平均最大回撤": "{:.2%}",
-                }), width="stretch", hide_index=True,
-            )
-        best = sweep.loc[sweep.groupby("strategy_id")["cumulative_return"].idxmax(), [
-            "strategy_name", "threshold_label", "cumulative_return", "max_drawdown", "profitable_trade_rate",
-        ]].rename(columns={
-            "strategy_name": "策略", "threshold_label": "样本内最佳止盈", "cumulative_return": "累计收益",
-            "max_drawdown": "最大回撤", "profitable_trade_rate": "交易胜率",
-        }).sort_values("累计收益", ascending=False)
-        st.dataframe(
-            best.style.format({"累计收益": "{:.2%}", "最大回撤": "{:.2%}", "交易胜率": "{:.2%}"}),
-            width="stretch", hide_index=True,
-        )
-        event_items = [item for item in suite["strategies"] if item["strategy_id"] != "baseline_top10_3d"]
-        item_map = {item["strategy_id"]: item for item in event_items}
-        base_items = [item for item in event_items if not item["strategy_id"].endswith("_confirm2")]
-        paired_items = [item for item in base_items if f"{item['strategy_id']}_confirm2" in item_map]
-        improved = sum(
-            item_map[f"{item['strategy_id']}_confirm2"]["metrics"]["cumulative_return"]
-            > item["metrics"]["cumulative_return"]
-            for item in paired_items
-        )
-        best_threshold = max(
-            suite.get("take_profit_sweep_summary", []),
-            key=lambda item: item["median_cumulative_return"],
-        )
-        mean_win_rate = sum(item["metrics"]["profitable_trade_rate"] for item in base_items) / len(base_items)
-        mean_winner = sum(item["metrics"]["average_winner_return"] for item in base_items) / len(base_items)
-        mean_loser = abs(sum(item["metrics"]["average_loser_return"] for item in base_items) / len(base_items))
-        break_even = mean_loser / (mean_winner + mean_loser) if mean_winner + mean_loser else 0
-        st.subheader("本批次诊断")
-        st.markdown(
-            f"- **止盈不是设得太高**：跨策略累计收益中位数最好的阈值是 **{best_threshold['threshold']}**；"
-            "20% 更可能过早截断趋势，但单一历史区间不能证明未来最优。\n"
-            f"- **入场质量与反复换手是主要问题**：原始策略平均交易胜率约 **{mean_win_rate:.1%}**，"
-            f"按平均盈利/亏损幅度估算的盈亏平衡胜率约为 **{break_even:.1%}**。\n"
-            f"- **延迟一天退出有选择性价值**：当前保留的 {len(paired_items)} 个完整配对中有 **{improved} 个**改善、{len(paired_items)-improved} 个变差，"
-            "不能把两日确认统一视为更优。\n"
-            "- **成交量已经纳入**：当前流动性类别权重为 15%，包括 20 日平均成交额和 5/20 日成交额比；"
-            "它目前是流动性/活跃度评分，不是放量突破确认，后者应另做独立变量测试。"
-        )
+        positive_ids = {item["strategy_id"] for item in visible_strategies}
+        sweep = sweep[sweep["strategy_id"].isin(positive_ids) & sweep["cumulative_return"].gt(0)]
+        if not sweep.empty:
+            st.subheader("盈利策略的止盈参数对照")
+            best = sweep.sort_values("cumulative_return", ascending=False)[[
+                "strategy_name", "threshold_label", "cumulative_return", "max_drawdown", "profitable_trade_rate",
+            ]].rename(columns={"strategy_name": "策略", "threshold_label": "止盈参数",
+                              "cumulative_return": "累计收益", "max_drawdown": "最大回撤",
+                              "profitable_trade_rate": "交易胜率"})
+            st.dataframe(best.style.format({"累计收益": "{:.2%}", "最大回撤": "{:.2%}",
+                                            "交易胜率": "{:.2%}"}), width="stretch", hide_index=True)
     control, _ = st.columns([3, 5])
-    selected = control.selectbox("查看策略规则", suite["strategies"], format_func=lambda value: value["name"])
+    selected = control.selectbox("查看策略规则", visible_strategies, format_func=lambda value: value["name"])
     threshold = selected["metrics"].get("take_profit_threshold")
     threshold_note = (
         f"该策略在盈利达到{threshold:.0%}时记录完整事件并止盈。"
@@ -748,7 +717,7 @@ def render_backtest() -> None:
     st.title("策略分析")
     folders = _strategy_result_folders()
     if not folders:
-        st.info("尚无回测结果。请先运行：python scripts/run_strategy_suite.py")
+        st.info("当前没有累计收益为正的回测结果。亏损交易仍可在‘亏损诊断’查看。")
         return
     control, _ = st.columns([3, 5])
     folder = control.selectbox("选择策略回测结果", folders, format_func=_result_label)
@@ -845,11 +814,17 @@ def render_strategy_lab() -> None:
         "围绕当前最佳规则做参数消融：连续3次进入 Top20/Top25，组合不同退出排名、"
         "卖出确认次数和固定止盈。全部结果均为同一区间的样本内比较。"
     )
-    folders = sorted(
-        {path.parent for path in STRATEGY_LAB_ROOT.glob("*/progress.json")}, reverse=True,
-    )
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    pool_config = {**config, "strategy": {**config["strategy"], "top_k": 50}}
+    pool_key = strategy_key(pool_config)[:8]
+    batches = _suite_folders()
+    latest_batch = batches[0].name if batches else ""
+    folders = sorted({path.parent for path in STRATEGY_LAB_ROOT.glob("*/progress.json")
+                      if path.parent.name.startswith(f"{latest_batch}_")
+                      and f"pool-{pool_key}" in path.parent.name}, reverse=True)
     if not folders:
-        st.info("尚无试验结果。请运行：python scripts/run_strategy_lab.py")
+        st.info("当前可交易股票池还没有匹配的试验场结果；旧股票池的试验已归档，不参与今日推荐。"
+                "如需重测，运行 python scripts/run_strategy_lab.py。")
         return
     control, _ = st.columns([2.2, 5.8])
     folder = control.selectbox("试验批次", folders, format_func=lambda value: value.name)
@@ -878,7 +853,11 @@ def render_strategy_lab() -> None:
     if not results_path.exists():
         st.info("首个参数组合尚未完成。")
         return
-    results = pd.read_csv(results_path).sort_values("cumulative_return", ascending=False).head(20).copy()
+    results = pd.read_csv(results_path)
+    results = results[results["cumulative_return"].gt(0)].sort_values("cumulative_return", ascending=False).head(20).copy()
+    if results.empty:
+        st.info("已完成组合中暂无累计收益为正的策略。")
+        return
     results.insert(0, "排名", range(1, len(results) + 1))
     display = _integerize_counts(results.rename(columns={
         "strategy_name": "试验规则", "entry_rank": "连续入选范围", "exit_rank": "跌出范围",
@@ -896,7 +875,7 @@ def render_strategy_lab() -> None:
         "累计收益", "年化收益", "超额收益", "最大回撤", "年化波动",
         "交易次数", "交易胜率", "平均持有交易日", "止盈次数",
     ]
-    st.subheader("当前收益率前二十")
+    st.subheader("当前盈利组合前二十")
     st.dataframe(
         display[columns_to_show].style.format({
             "止盈阈值": "{:.0%}", "累计收益": "{:.2%}", "年化收益": "{:.2%}",
@@ -919,44 +898,9 @@ def render_strategy_lab() -> None:
 
 def render_signal_alerts() -> None:
     st.title("交易信号提醒")
-    st.caption("合并策略试验场前五名与原联合推荐前三名，共八套规则。页面只生成研究提醒，不会自动下单。")
-    ensemble_folders = sorted(
-        {path.parent for path in SIGNAL_ENSEMBLE_ROOT.glob("*/metrics.json")}, reverse=True,
-    )
-    if ensemble_folders:
-        ensemble_folder = ensemble_folders[0]
-        ensemble_metrics = json.loads((ensemble_folder / "metrics.json").read_text(encoding="utf-8"))
-        st.subheader("八策略联合近期稳定性复测")
-        recent_cards = st.columns(4)
-        recent_cards[0].metric("最近三个月累计收益", _percent(ensemble_metrics["cumulative_return"]))
-        recent_cards[1].metric("同期基准收益", _percent(ensemble_metrics["benchmark_return"]))
-        recent_cards[2].metric("超额收益", _percent(ensemble_metrics["excess_return"]))
-        recent_cards[3].metric("最大回撤", _percent(ensemble_metrics["max_drawdown"]))
-        st.warning(ensemble_metrics.get("selection_bias_warning", "该复测不是严格样本外检验。"))
-        components_path = ensemble_folder / "components.csv"
-        if components_path.exists():
-            components = _integerize_counts(pd.read_csv(components_path).rename(columns={
-                "source": "来源", "name": "策略", "historical_return": "完整区间收益",
-                "recent_cumulative_return": "最近三个月收益",
-                "recent_max_drawdown": "近期最大回撤",
-                "recent_trade_count": "近期交易次数", "recent_trade_win_rate": "近期交易胜率",
-            }))
-            with st.expander("查看八个子策略近期表现"):
-                st.dataframe(
-                    components[["来源", "策略", "完整区间收益", "最近三个月收益", "近期最大回撤", "近期交易次数", "近期交易胜率"]]
-                    .style.format({
-                        "完整区间收益": "{:.2%}", "最近三个月收益": "{:.2%}",
-                        "近期最大回撤": "{:.2%}", "近期交易胜率": "{:.2%}",
-                    }), width="stretch", hide_index=True,
-                )
-                component_chart = alt.Chart(components).mark_bar().encode(
-                    x=alt.X("最近三个月收益:Q", axis=alt.Axis(format=".0%", labelAngle=0)),
-                    y=alt.Y("策略:N", sort="-x", axis=alt.Axis(labelAngle=0, title=None)),
-                    tooltip=["策略:N", alt.Tooltip("最近三个月收益:Q", format=".2%")],
-                    color=alt.condition(alt.datum["最近三个月收益"] >= 0, alt.value("#d62728"), alt.value("#2ca02c")),
-                ).properties(height=320)
-                st.altair_chart(component_chart, width="stretch")
-        st.divider()
+    st.caption("仅汇总历史累计收益为正的策略；新买入候选已排除科创板和创业板。页面只给出研究提醒，不会自动下单。")
+    st.info("旧八策略联合收益来自过期股票池，已从日常页面隐藏；试验场旧结果也不会参与当前联合信号。"
+            "仅当新批次策略累计收益为正时才生成联合买入提醒。")
     config = load_config(PROJECT_ROOT / "config.yaml")
     dates = _selection_dates()
     if not dates:
@@ -1010,7 +954,7 @@ def render_signal_alerts() -> None:
                 {True: "成功", False: "失败"},
             )
             st.dataframe(history_display, width="stretch", hide_index=True)
-    with st.spinner("正在计算八策略联合信号……"):
+    with st.spinner("正在计算盈利策略联合信号……"):
         joint, metadata = combined_signal_recommendations(config, selected_date)
     definitions = pd.DataFrame(metadata.get("strategies", []))
     if not definitions.empty:
@@ -1020,7 +964,7 @@ def render_signal_alerts() -> None:
             "confirmation_days": "卖出确认次数", "take_profit": "止盈阈值",
             "historical_return": "历史累计收益",
         })
-        with st.expander("查看八套策略规则", expanded=False):
+        with st.expander(f"查看{len(definitions)}套保留策略规则", expanded=False):
             st.dataframe(
                 rules[["来源", "策略", "连续入选范围", "入选确认次数", "跌出范围", "卖出确认次数", "止盈阈值", "历史累计收益"]]
                 .style.format({"止盈阈值": "{:.0%}", "历史累计收益": "{:.2%}"}),
@@ -1033,7 +977,7 @@ def render_signal_alerts() -> None:
     joint["consecutive_top20"] = joint["ts_code"].map(
         lambda code: history_stats.get(code, {}).get("consecutive_top20", 0)
     )
-    st.subheader("八策略联合推荐")
+    st.subheader(f"{len(definitions)}策略联合推荐")
     joint_display = joint.rename(columns={
         "joint_rank": "联合排序", "ts_code": "股票代码", "name": "证券简称",
         "rank": "当日总排名", "total_score": "综合得分", "close": "收盘价",
@@ -1194,11 +1138,13 @@ def render_account() -> None:
                     config, latest_date, str(holding["ts_code"]),
                     float(holding["cost_price"]), 0.10,
                 )
-                take_profit_count = int(reminders["take_profit_met"].sum())
-                rank_exit_count = int(reminders["rank_exit_met"].sum())
+                take_profit_count = int(reminders["take_profit_met"].sum()) if not reminders.empty else 0
+                rank_exit_count = int(reminders["rank_exit_met"].sum()) if not reminders.empty else 0
                 stop_met = bool(market["price_stop_met"])
                 if take_profit_count or rank_exit_count or stop_met:
                     signal = "检查清仓"
+                elif reminders.empty:
+                    signal = "暂无有效策略"
                 else:
                     signal = "继续观察"
                 signal_rows.append({
@@ -1251,12 +1197,15 @@ def render_account() -> None:
 
     basic = store.load_basic()
     basic = basic[basic["list_status"].eq("L")].drop_duplicates("ts_code")
+    basic = basic[~is_star_market(basic.ts_code, basic.get("market"))
+                  & ~is_chinext_market(basic.ts_code, basic.get("market"))].copy()
     labels = dict(zip(basic["ts_code"], basic["name"], strict=False))
     spellings = (
         dict(zip(basic["ts_code"], basic["cnspell"].fillna(""), strict=False))
         if "cnspell" in basic else {}
     )
     st.subheader("新增或修改持仓")
+    st.caption("录入选项已排除当前账户不能买入的科创板和创业板；原有持仓记录不会被删除。")
     code = _stock_search(
         "股票", basic["ts_code"].tolist(), labels, spellings, "account_stock",
     )
@@ -1281,16 +1230,46 @@ def render_account() -> None:
 
 
 def render_strategy_hub() -> None:
+    st.info("当前新选股与新回测会排除科创板和创业板；旧批次不代表你的可交易股票池。"
+            "亏损诊断仍保留原始记录用于追查价格口径。")
     section = st.sidebar.radio(
-        "策略研究分类", ["策略总览", "策略分析", "策略试验场"],
-        help="三个分类共用同一个网址，切换时只加载当前分类。",
+        "策略研究分类", ["策略总览", "策略分析", "策略试验场", "亏损诊断"],
+        help="四个分类共用同一个网址，切换时只加载当前分类。",
     )
     if section == "策略总览":
         render_strategy_overview()
     elif section == "策略分析":
         render_backtest()
-    else:
+    elif section == "策略试验场":
         render_strategy_lab()
+    else:
+        render_loss_audit()
+
+
+def render_loss_audit() -> None:
+    st.title("各策略亏损诊断")
+    root = BACKTESTS_ROOT / "loss_audit"
+    detail_path, summary_path = root / "worst_10_by_strategy.csv", root / "strategy_summary.csv"
+    if not detail_path.exists() or not summary_path.exists():
+        st.info("尚未生成审计结果。运行 conda run -n jkquant python scripts/audit_worst_trades.py。")
+        return
+    detail = pd.read_csv(detail_path)
+    summary = pd.read_csv(summary_path)
+    st.warning("旧批次策略套件以未复权买卖价计算收益：除权、送转或分红日可能出现假亏损；"
+               "新批次套件和研究引擎采用再投资代理。‘回测遗漏百分点’比较各引擎自身价格口径，"
+               "‘除权影响百分点’仅表示原始价差变化，不等于遗漏；代理仍非真实分红入账。")
+    st.dataframe(summary.drop(columns=["来源"], errors="ignore").style.format({
+        "胜率": "{:.1%}", "最差单笔净收益": "{:.1%}",
+    }), hide_index=True, width="stretch")
+    selected = st.selectbox("查看策略最差十笔交易", summary["策略"].tolist(), key="loss_audit_strategy")
+    trades = detail[detail["策略"].eq(selected)].drop(columns=["来源", "结果类型"], errors="ignore")
+    st.dataframe(trades.style.format({"原始价差": "{:.2%}", "回测口径价差": "{:.2%}",
+                                      "回测净收益": "{:.2%}", "除权参考价差": "{:.2%}",
+                                      "除权影响百分点": "{:.2f}", "回测遗漏百分点": "{:.2f}",
+                                      "持有期最高浮盈": "{:.2%}", "持有期最大浮亏": "{:.2%}"}),
+                 hide_index=True, width="stretch")
+    st.caption("仅列已平仓且亏损的交易，按原回测净收益从低到高排序。未生成逐股开平仓账本的"
+               "三日调仓基线与八策略组合不在此表；新旧引擎成本和持仓口径也不可直接对比。")
 
 
 def render_market_overview() -> None:
@@ -1379,6 +1358,115 @@ def render_market_overview() -> None:
     )
 
 
+@st.cache_data(ttl=1800, show_spinner="正在整理连板历史和晋级观察指标…")
+def _cached_board_history(cache_version: tuple[float, ...]) -> pd.DataFrame:
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    store = build_store(config)
+    return build_board_history(
+        store.load_daily(), store.load_market_dataset("limit"), store.load_basic(),
+        store.load_market_dataset("daily_basic"),
+        exclude_star_market=config["market"].get("exclude_star_market", True),
+        exclude_chinext_market=config["market"].get("exclude_chinext_market", True),
+    )
+
+
+def render_limit_up() -> None:
+    st.title("打板观察")
+    st.caption("基于收盘封住涨停价的日线统计；已排除科创板和创业板。收盘后更新，不是盘中可成交的打板信号。")
+    config = load_config(PROJECT_ROOT / "config.yaml")
+    store = build_store(config)
+    paths = [store.daily_path, store.limit_path, store.basic_path, store.daily_basic_path,
+             PROJECT_ROOT / "config.yaml"]
+    if any(not path.exists() for path in paths[:3]):
+        st.info("缺少日线、涨跌停价或股票列表，请先运行每日数据更新。")
+        return
+    version = tuple(path.stat().st_mtime if path.exists() else 0.0 for path in paths)
+    boards = _cached_board_history(version)
+    if boards.empty:
+        st.info("当前缓存内没有可识别的收盘涨停股票。")
+        return
+    dates = sorted(pd.Timestamp(value).date() for value in boards.trade_date.unique())
+    control, _ = st.columns([1.4, 6.6])
+    requested = control.date_input("观察日期", value=dates[-1], min_value=dates[0], max_value=dates[-1],
+                                   format="YYYY-MM-DD", key="limit_up_date")
+    selected = max((day for day in dates if day <= requested), default=dates[0])
+    day = boards[boards.trade_date.eq(pd.Timestamp(selected))].copy()
+    candidates, validation = promotion_candidates(boards, pd.Timestamp(selected))
+    if not candidates.empty:
+        day = day.merge(candidates[["ts_code", "estimated_promotion"]], on="ts_code", how="left")
+    first, second, more = (day[day.streak.eq(1)], day[day.streak.eq(2)], day[day.streak.ge(3)])
+    measures = st.columns(5)
+    measures[0].metric("首板", len(first))
+    measures[1].metric("二连板", len(second))
+    measures[2].metric("三连板及以上", len(more))
+    measures[3].metric("最高连板", int(day.streak.max()))
+    measures[4].metric("一字板", int(day.one_word.sum()))
+    history = promotion_summary(boards, pd.Timestamp(selected))
+    if not history.empty:
+        stat = {int(row["当前板数"]): row for _, row in history.iterrows()}
+        for stage, label in ((1, "首板→二板"), (2, "二板→三板")):
+            if stage in stat:
+                item = stat[stage]
+                st.caption(f"历史{label}：{item['历史晋级率']:.1%}（{int(item['晋级数'])}/{int(item['样本数'])}，"
+                           "只统计所选日期之前已有次日结果的封板样本；不是今日个股预测概率）")
+    tab1, tab2, tab3 = st.tabs(["连板名单", "行业与龙头候选", "晋级观察"])
+
+    def display(frame: pd.DataFrame) -> pd.DataFrame:
+        fields = ["ts_code", "name", "industry", "streak", "close", "amount", "pre20_range",
+                  "low_position", "volume_surge", "turnover_rate", "industry_boards", "one_word",
+                  "estimated_promotion"]
+        result = frame[fields].copy()
+        result["amount"] = result.amount / 100_000  # Tushare amount is in thousand yuan.
+        for field in ("pre20_range", "low_position"):
+            result[field] = (result[field] * 100).round(1)
+        result["volume_surge"] = result.volume_surge.round(2)
+        result["turnover_rate"] = result.turnover_rate.round(1)
+        result["estimated_promotion"] = (result.estimated_promotion * 100).round(1)
+        return result.rename(columns={"ts_code": "代码", "name": "简称", "industry": "行业(当前)",
+                                      "streak": "连板数", "close": "收盘价", "amount": "成交额(亿元)",
+                                      "pre20_range": "板前20日振幅(%)", "low_position": "120日价格位置(%)",
+                                      "volume_surge": "当日放量倍数", "turnover_rate": "换手率(%)",
+                                      "industry_boards": "同行业涨停数", "one_word": "一字板",
+                                      "estimated_promotion": "统计估计晋级率(%)"})
+
+    with tab1:
+        choice = st.radio("连板筛选", ["全部", "首板", "二连板", "三连板及以上"], horizontal=True)
+        view = {"全部": day, "首板": first, "二连板": second, "三连板及以上": more}[choice]
+        st.dataframe(display(view.sort_values(["streak", "estimated_promotion", "amount"], ascending=False)),
+                     hide_index=True, width="stretch")
+    with tab2:
+        industry = day.groupby("industry").agg(涨停家数=("ts_code", "size"),
+                                                最高连板=("streak", "max"),
+                                                二板及以上=("streak", lambda x: int(x.ge(2).sum())),
+                                                成交额=("amount", "sum")).reset_index()
+        industry["成交额(亿元)"] = (industry.pop("成交额") / 100_000).round(2)
+        industry = industry.rename(columns={"industry": "行业(当前)"}).sort_values(
+            ["涨停家数", "最高连板"], ascending=False)
+        st.dataframe(industry, hide_index=True, width="stretch")
+        st.subheader("各行业龙头观察候选")
+        leaders = day.sort_values(["industry", "streak", "amount"],
+                                  ascending=[True, False, False]).drop_duplicates("industry")
+        st.dataframe(display(leaders).head(30), hide_index=True, width="stretch")
+        st.caption("这里的‘龙头候选’仅指同一当前行业中连板数最高、再按成交额排序；不等于市场公认龙头。")
+    with tab3:
+        st.write("按历史相似条件估计次日继续收盘封板的概率，并分别排序首板与二板。")
+        if not validation.empty:
+            display_validation = validation.copy()
+            for field in ("整体晋级率", "每日评分前20%晋级率"):
+                display_validation[field] = (display_validation[field] * 100).round(1)
+            st.dataframe(display_validation, hide_index=True, width="stretch")
+            st.caption("上表两项晋级率单位为%；模型仅用验证期之前的数据拟合，在留出的较新日期检验。"
+                       "晋级率提升不等于交易盈利，也不保证未来维持。")
+        for stage, title in ((1, "首板→二板"), (2, "二板→三板")):
+            st.subheader(title)
+            view = day[day.streak.eq(stage)].sort_values("estimated_promotion", ascending=False)
+            st.dataframe(display(view), hide_index=True, width="stretch")
+        st.caption("模型使用板前横盘、复权口径价格位置、当日放量、换手、行业热度、一字板和成交额；"
+                   "统计估计尚未经概率校准，不能当成可实现买入收益。放量不证明主力启动。"
+                   "数据只有收盘日线，无法判断封单、开板次数或排队成交。"
+                   "ST 仅用当前简称及 5% 涨停幅度近似排除；行业为当前分类，历史行业归属可能不同。")
+
+
 def render_system_help() -> None:
     st.title("系统说明")
     st.subheader("系统现在如何运行")
@@ -1386,7 +1474,7 @@ def render_system_help() -> None:
         "1. **更新数据**：从 Tushare 增量获取股票列表、日/周/月线、每日估值、涨跌停、宏观数据和 510300 ETF，写入本地 Parquet。\n"
         "2. **更新财务**：利润表、资产负债表和现金流量表按股票断点续传，独立于每日选股任务。\n"
         "3. **计算因子**：每只股票只使用当日及之前的数据计算 8 个量价因子。\n"
-        "4. **过滤股票**：排除当前 ST、成交额不足、零成交和历史记录太短的股票。\n"
+        "4. **过滤股票**：排除科创板、创业板、当前 ST、成交额不足、零成交和历史记录太短的股票。\n"
         "5. **横截面打分**：把当日每个因子转成 0～1 的市场百分位得分。\n"
         "6. **生成候选**：按综合得分从高到低输出 Top-K，供人工继续研究。\n"
         "7. **历史回测**：使用前一交易日信号，在下一交易日执行；佣金万分之五且每笔最低5元，卖出另计印花税，并计入滑点。"
@@ -1432,6 +1520,7 @@ def main() -> None:
         st.Page(render_account, title="账户", icon="💼", url_path="account"),
         st.Page(render_strategy_hub, title="策略研究", icon="📊", url_path="strategy-research"),
         st.Page(render_market_overview, title="市场概览", icon="🌐", url_path="market"),
+        st.Page(render_limit_up, title="打板观察", icon="🚀", url_path="limit-up"),
         st.Page(render_system_help, title="系统说明", icon="ℹ️", url_path="help"),
     ], position="top")
     st.divider()

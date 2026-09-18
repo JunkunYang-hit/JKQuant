@@ -112,6 +112,7 @@ def run_event_strategy(
     trades: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     trade_sequence = 0
+    corporate_action_adjustments = 0
     buy_commission = float(costs["commission_buy"])
     sell_commission = float(costs["commission_sell"])
     min_commission = float(costs.get("min_commission", 0.0))
@@ -146,7 +147,8 @@ def run_event_strategy(
             "strategy_id": spec.strategy_id, "trade_id": position["trade_id"], "ts_code": code,
             "name": names.get(code, ""), "entry_date": position["entry_date"], "exit_date": trade_date.date(),
             "holding_trading_days": int(position["holding_days"]), "holding_period": f"{position['entry_date']} 至 {trade_date.date()}",
-            "entry_price": float(position["entry_price"]), "exit_price": price,
+            "entry_price": float(position["entry_price"]),
+            "entry_price_unadjusted": float(position["entry_price_unadjusted"]), "exit_price": price,
             "price_change": price / float(position["entry_price"]) - 1, "net_return": net_return,
             "max_gain": position["max_price"] / float(position["entry_price"]) - 1,
             "max_drawdown_during_holding": position["min_price"] / float(position["entry_price"]) - 1,
@@ -172,6 +174,17 @@ def run_event_strategy(
         for code, position in positions.items():
             position["holding_days"] += 1
             if code in market.index:
+                pre_close = float(market.at[code, "pre_close"])
+                if np.isfinite(pre_close) and pre_close > 0:
+                    previous_close = float(position["last_price"])
+                    if abs(previous_close - pre_close) > max(0.0051, previous_close * 0.00001):
+                        # Diagnostic reinvestment proxy: keeps pre/post ex-right
+                        # position value comparable; not actual dividend cash tax.
+                        ratio = previous_close / pre_close
+                        position["shares"] *= ratio
+                        for field in ("entry_price", "last_price", "max_price", "min_price"):
+                            position[field] /= ratio
+                        corporate_action_adjustments += 1
                 open_price = float(market.at[code, "open"])
                 position["max_price"] = max(position["max_price"], open_price)
                 position["min_price"] = min(position["min_price"], open_price)
@@ -260,7 +273,8 @@ def run_event_strategy(
                 cash -= gross + fee
                 positions[code] = {
                     "trade_id": f"{spec.strategy_id}-{trade_sequence:06d}", "shares": shares,
-                    "entry_date": trade_date.date(), "entry_price": open_price, "cost_basis": gross + fee,
+                    "entry_date": trade_date.date(), "entry_price": open_price,
+                    "entry_price_unadjusted": open_price, "cost_basis": gross + fee,
                     "holding_days": 1, "threshold_date": None, "last_price": open_price,
                     "max_price": open_price, "min_price": open_price, "entry_rank": rank,
                 }
@@ -317,6 +331,7 @@ def run_event_strategy(
             "name": names.get(code, ""), "entry_date": position["entry_date"], "exit_date": final_date.date(),
             "holding_period": f"{position['entry_date']} 至 {final_date.date()}",
             "holding_trading_days": int(position["holding_days"]), "entry_price": float(position["entry_price"]),
+            "entry_price_unadjusted": float(position["entry_price_unadjusted"]),
             "exit_price": price, "price_change": price / float(position["entry_price"]) - 1,
             "net_return": (position["shares"] * price) / float(position["cost_basis"]) - 1,
             "max_gain": position["max_price"] / float(position["entry_price"]) - 1,
@@ -338,6 +353,8 @@ def run_event_strategy(
         "take_profit_threshold": take_profit, "exit_confirmation_days": spec.exit_confirmation_days,
         "capital_fraction_per_entry": spec.capital_fraction_per_entry,
         "max_positions": spec.max_positions,
+        "corporate_action_mode": "reinvest_proxy",
+        "corporate_action_adjustment_count": corporate_action_adjustments,
         "take_profit_count": int(closed["exit_reason"].eq(take_profit_label).sum()) if not closed.empty else 0,
         "crossed_20_count": len(events_frame), "completed_trades": len(closed), "total_trade_count": len(closed),
         "profitable_trade_count": int(closed["net_return"].gt(0).sum()) if not closed.empty else 0,

@@ -264,12 +264,13 @@ def best_strategy_recommendations(
         (
             item for item in suite.get("strategies", [])
             if item.get("strategy_id") in spec_by_id
+            and float(item["metrics"]["cumulative_return"]) > 0
         ),
         key=lambda item: float(item["metrics"]["cumulative_return"]),
         reverse=True,
     )[:top_n]
     if not ranked:
-        return pd.DataFrame(), {"reason": "回测结果中没有可用于当日信号的策略", "strategies": []}
+        return pd.DataFrame(), {"reason": "回测结果中没有累计收益为正且可用于当日信号的策略", "strategies": []}
 
     signal_config = {
         **config,
@@ -314,7 +315,7 @@ def best_strategy_recommendations(
     } for item in ranked]
     if not rows:
         return pd.DataFrame(), {
-            "reason": "最佳五策略在所选日期均没有满足入场条件的标的",
+            "reason": "保留的盈利策略在所选日期均没有满足入场条件的标的",
             "strategies": strategy_meta, "suite": suite_path.parent.name,
             "coverage": coverage, "calculation": calculation,
         }
@@ -341,21 +342,30 @@ def best_strategy_recommendations(
 
 
 def combined_signal_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return five best lab variants plus the best three retained suite strategies."""
+    """Return up to five lab and three suite strategies with positive stored returns."""
     definitions: list[dict[str, Any]] = []
+    suite_root = resolve_path(
+        config, config.get("strategy_suite", {}).get("output_dir", "backtests/strategy_suite")
+    )
+    suite_paths = sorted(suite_root.glob("*/suite.json"), reverse=True)
+    latest_suite_name = suite_paths[0].parent.name if suite_paths else ""
+    pool_key = strategy_key(_top50_config(config))[:8]
     lab_root = resolve_path(
         config, config.get("strategy_lab", {}).get("output_dir", "backtests/strategy_lab")
     )
     lab_paths = []
     for candidate in sorted(lab_root.glob("*/results.csv"), reverse=True):
+        if not candidate.parent.name.startswith(f"{latest_suite_name}_") or f"pool-{pool_key}" not in candidate.parent.name:
+            continue
         progress_path = candidate.parent / "progress.json"
         if not progress_path.exists() or json.loads(progress_path.read_text(encoding="utf-8")).get("status") == "completed":
             lab_paths.append(candidate)
     if lab_paths:
-        lab = pd.read_csv(lab_paths[0]).sort_values("cumulative_return", ascending=False).head(5)
+        lab = pd.read_csv(lab_paths[0])
+        lab = lab[lab["cumulative_return"].gt(0)].sort_values("cumulative_return", ascending=False).head(5)
         for _, row in lab.iterrows():
             definitions.append({
-                "strategy_id": f"lab_{row['experiment_id']}", "source": "策略试验场前五",
+                "strategy_id": f"lab_{row['experiment_id']}", "source": "策略试验场盈利组",
                 "name": str(row["strategy_name"]), "entry_rank": int(row["entry_rank"]),
                 "consecutive_rank": int(row["entry_rank"]), "consecutive_days": 3,
                 "exit_rank": int(row["exit_rank"]),
@@ -363,21 +373,19 @@ def combined_signal_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "take_profit": float(row["take_profit"]),
                 "historical_return": float(row["cumulative_return"]),
             })
-    suite_root = resolve_path(
-        config, config.get("strategy_suite", {}).get("output_dir", "backtests/strategy_suite")
-    )
-    suite_paths = sorted(suite_root.glob("*/suite.json"), reverse=True)
     if suite_paths:
         suite = json.loads(suite_paths[0].read_text(encoding="utf-8"))
         spec_by_id = {spec.strategy_id: spec for spec in STRATEGIES}
         ranked = sorted(
-            (item for item in suite.get("strategies", []) if item.get("strategy_id") in spec_by_id),
+            (item for item in suite.get("strategies", [])
+             if item.get("strategy_id") in spec_by_id
+             and float(item["metrics"]["cumulative_return"]) > 0),
             key=lambda item: float(item["metrics"]["cumulative_return"]), reverse=True,
         )[:3]
         for item in ranked:
             spec = spec_by_id[item["strategy_id"]]
             definitions.append({
-                "strategy_id": spec.strategy_id, "source": "原联合推荐前三",
+                "strategy_id": spec.strategy_id, "source": "原策略盈利组",
                 "name": spec.name, "entry_rank": spec.entry_rank,
                 "consecutive_rank": spec.consecutive_rank,
                 "consecutive_days": spec.consecutive_days, "exit_rank": spec.exit_rank,
@@ -431,11 +439,11 @@ def _consecutive_outside(
 def combined_signal_recommendations(
     config: dict[str, Any], selected_date: date,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Aggregate current entry candidates from the fixed eight-strategy signal set."""
+    """Aggregate current entries from historically positive stored strategies."""
     definitions = combined_signal_definitions(config)
-    if len(definitions) != 8:
+    if not definitions:
         return pd.DataFrame(), {
-            "reason": f"需要5个试验场策略和3个原策略，当前只找到{len(definitions)}个。",
+            "reason": "当前历史结果中没有累计收益为正的策略；不生成联合买入候选。",
             "strategies": definitions,
         }
     signal_config = {**config, "strategy": {**config["strategy"], "top_k": CACHE_TOP_K}}
@@ -462,7 +470,7 @@ def combined_signal_recommendations(
             })
     metadata = {"reason": "", "strategies": definitions, "calculation": calculation}
     if not rows:
-        metadata["reason"] = "八策略在所选日期均没有满足新开仓条件的股票。"
+        metadata["reason"] = "当前保留策略在所选日期均没有满足新开仓条件的股票。"
         return pd.DataFrame(), metadata
     detail = pd.DataFrame(rows)
     recommendations = detail.groupby(["ts_code", "name"], as_index=False).agg(
@@ -531,12 +539,12 @@ def stock_signal_reminders(
 def run_recent_signal_ensemble(
     config: dict[str, Any], months: int = 3, end_date: date | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    """Backtest the eight signal strategies as equal-capital independent sleeves."""
+    """Backtest historically positive signals as equal-capital independent sleeves."""
     if months <= 0:
         raise ValueError("回测月数必须大于0")
     definitions = combined_signal_definitions(config)
-    if len(definitions) != 8:
-        raise RuntimeError(f"八策略定义不完整，当前找到 {len(definitions)} 套")
+    if not definitions:
+        raise RuntimeError("当前没有累计收益为正的策略可用于联合回测")
     store = build_store(config)
     daily = store.load_daily()
     if daily.empty:
@@ -568,7 +576,7 @@ def run_recent_signal_ensemble(
     for definition in definitions:
         spec = StrategySpec(
             strategy_id=definition["strategy_id"], name=definition["name"],
-            description=f"八策略联合中的独立资金子账户：{definition['source']}",
+            description=f"正收益策略联合中的独立资金子账户：{definition['source']}",
             entry_rank=int(definition["entry_rank"]), exit_rank=int(definition["exit_rank"]),
             consecutive_rank=(
                 int(definition["consecutive_rank"])
@@ -632,12 +640,12 @@ def run_recent_signal_ensemble(
     ensemble["drawdown"] = ensemble["equity"] / ensemble["equity"].cummax() - 1
     metrics = calculate_metrics(ensemble)
     metrics.update({
-        "strategy_id": "eight_strategy_equal_sleeves_recent",
-        "strategy_name": "八策略联合（等资金子账户）最近三个月",
-        "strategy_description": "八套策略各使用1/8初始资金并独立执行，组合权益为八个子账户之和。",
+        "strategy_id": "positive_strategy_equal_sleeves_recent",
+        "strategy_name": "正收益策略联合（等资金子账户）最近三个月",
+        "strategy_description": f"{len(definitions)}套历史正收益策略等额分配初始资金并独立执行。",
         "requested_months": months, "start_date": start.isoformat(), "end_date": end.isoformat(),
         "component_count": len(definitions), "selection_bias_warning": (
-            "八套策略由包含本区间的历史结果筛选，本结果是近期稳定性复测，不是严格样本外测试。"
+            "策略由包含本区间的历史结果筛选，本结果是近期稳定性复测，不是严格样本外测试。"
         ),
     })
     output = resolve_path(config, "backtests/signal_ensemble") / f"{start}_{end}"
@@ -965,7 +973,7 @@ def run_strategy_lab(
     ).hexdigest()[:8]
     output = resolve_path(
         config, settings.get("output_dir", "backtests/strategy_lab")
-    ) / f"{start}_{end}_cost-{cost_key}"
+    ) / f"{start}_{end}_cost-{cost_key}_pool-{strategy_key(_top50_config(config))[:8]}"
     return run_experiments(
         daily, rankings, names, start, end,
         float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],

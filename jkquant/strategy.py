@@ -5,6 +5,22 @@ from typing import Any
 import pandas as pd
 
 
+def is_star_market(codes: pd.Series, markets: pd.Series | None = None) -> pd.Series:
+    """STAR Market shares need a separate trading permission (688/689.SH)."""
+    by_code = codes.fillna("").astype(str).str.match(r"^68[89]\d{3}\.SH$")
+    if markets is None:
+        return by_code
+    return by_code | markets.fillna("").astype(str).eq("科创板")
+
+
+def is_chinext_market(codes: pd.Series, markets: pd.Series | None = None) -> pd.Series:
+    """ChiNext shares need a separate trading permission (300/301.SZ)."""
+    by_code = codes.fillna("").astype(str).str.match(r"^30[01]\d{3}\.SZ$")
+    if markets is None:
+        return by_code
+    return by_code | markets.fillna("").astype(str).eq("创业板")
+
+
 def select_stocks(
     factors: pd.DataFrame,
     basic: pd.DataFrame,
@@ -20,6 +36,10 @@ def select_stocks(
     universe_count = len(latest)
     latest = latest.merge(basic, on="ts_code", how="left")
     market = config["market"]
+    if market.get("exclude_star_market", True):
+        latest = latest[~is_star_market(latest["ts_code"], latest.get("market"))].copy()
+    if market.get("exclude_chinext_market", True):
+        latest = latest[~is_chinext_market(latest["ts_code"], latest.get("market"))].copy()
     if market.get("exclude_st", True) and use_current_metadata:
         latest = latest[~latest["name"].fillna("").str.upper().str.contains("ST")]
     if "delist_date" in latest:
