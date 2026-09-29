@@ -18,7 +18,7 @@ def parse_date(value: str) -> date:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="执行全部候选策略并生成横向比较结果")
+    parser = argparse.ArgumentParser(description="执行当前七套研究策略并生成横向比较结果")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "config.yaml"))
     parser.add_argument("--start", type=parse_date)
     parser.add_argument("--end", type=parse_date)

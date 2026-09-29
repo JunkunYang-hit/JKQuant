@@ -21,6 +21,14 @@ def is_chinext_market(codes: pd.Series, markets: pd.Series | None = None) -> pd.
     return by_code | markets.fillna("").astype(str).eq("创业板")
 
 
+def is_bse_market(codes: pd.Series, markets: pd.Series | None = None) -> pd.Series:
+    """Beijing Stock Exchange shares require a separate investor permission."""
+    by_code = codes.fillna("").astype(str).str.endswith(".BJ")
+    if markets is None:
+        return by_code
+    return by_code | markets.fillna("").astype(str).isin(["北交所", "北证A股"])
+
+
 def select_stocks(
     factors: pd.DataFrame,
     basic: pd.DataFrame,
@@ -40,6 +48,8 @@ def select_stocks(
         latest = latest[~is_star_market(latest["ts_code"], latest.get("market"))].copy()
     if market.get("exclude_chinext_market", True):
         latest = latest[~is_chinext_market(latest["ts_code"], latest.get("market"))].copy()
+    if market.get("exclude_bse_market", True):
+        latest = latest[~is_bse_market(latest["ts_code"], latest.get("market"))].copy()
     if market.get("exclude_st", True) and use_current_metadata:
         latest = latest[~latest["name"].fillna("").str.upper().str.contains("ST")]
     if "delist_date" in latest:

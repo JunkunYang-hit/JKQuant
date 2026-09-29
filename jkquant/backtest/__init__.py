@@ -1,6 +1,1 @@
-"""Historical, long-only Top-K backtesting."""
-
-from .engine import BacktestResult, run_backtest
-
-__all__ = ["BacktestResult", "run_backtest"]
-
+"""Backtesting primitives for the retained strategy suite."""

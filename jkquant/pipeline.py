@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import time
 from datetime import date, timedelta
@@ -11,13 +9,11 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 
-from .backtest.engine import run_backtest as execute_backtest
-from .backtest.metrics import calculate_metrics
-from .backtest.reporting import write_backtest_report
-from .backtest.strategy_lab import run_experiments
 from .backtest.strategy_suite import (
-    BASE_STRATEGIES, STRATEGIES, StrategySpec, run_event_strategy, write_strategy_result,
-    write_suite_index,
+    STRATEGIES, run_event_strategy, write_strategy_result, write_suite_index,
+)
+from .backtest.low_position_strategy import (
+    LOW_POSITION_STRATEGIES, build_priority_signal_history, run_low_position_strategy,
 )
 from .config import resolve_path
 from .data.akshare_provider import AkshareMetadataProvider
@@ -28,7 +24,6 @@ from .data.tushare_provider import TushareProvider
 from .data.updater import update_data, update_enriched_data
 from .factors import calculate_factors
 from .report import write_csv
-from .signal_statistics import streak2_leader_continuation
 from .strategy import select_stocks
 
 LOGGER = logging.getLogger(__name__)
@@ -219,446 +214,6 @@ def recommendation_history_stats(
     }
 
 
-def top20_streak2_leader_probability(
-    config: dict[str, Any], selected_date: date,
-    start_date: date = RECOMMENDATION_HISTORY_START,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Historical continuation rate for the best-ranked exact two-day Top20 streak."""
-    store = build_store(config)
-    daily = store.load_daily()
-    trading_dates = [
-        pd.Timestamp(value).date() for value in sorted(daily["trade_date"].unique())
-        if start_date <= pd.Timestamp(value).date() <= selected_date
-    ]
-    cache = SelectionCache(store.root / "selection_results.sqlite3")
-    rankings = cache.history(
-        strategy_key(_top50_config(config)), start_date, selected_date,
-    )
-    summary, events = streak2_leader_continuation(rankings, trading_dates, top_n=20)
-    basic = store.load_basic().drop_duplicates("ts_code")
-    names = basic.set_index("ts_code")["name"].fillna("").astype(str).to_dict()
-    candidate = summary.get("current_candidate")
-    if candidate:
-        candidate["name"] = names.get(candidate["ts_code"], "")
-    if not events.empty:
-        events["name"] = events["ts_code"].map(names).fillna("")
-    summary["cached_trading_dates"] = int(rankings["trade_date"].nunique()) if not rankings.empty else 0
-    summary["expected_trading_dates"] = len(trading_dates)
-    return summary, events
-
-
-def best_strategy_recommendations(
-    config: dict[str, Any], selected_date: date, top_n: int = 5,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Build next-open candidates supported by the best backtested event strategies."""
-    suite_root = resolve_path(
-        config, config.get("strategy_suite", {}).get("output_dir", "backtests/strategy_suite")
-    )
-    suite_paths = sorted(suite_root.glob("*/suite.json"), reverse=True)
-    if not suite_paths:
-        return pd.DataFrame(), {"reason": "尚无多策略回测结果", "strategies": []}
-    suite_path = suite_paths[0]
-    suite = json.loads(suite_path.read_text(encoding="utf-8"))
-    spec_by_id = {spec.strategy_id: spec for spec in STRATEGIES}
-    ranked = sorted(
-        (
-            item for item in suite.get("strategies", [])
-            if item.get("strategy_id") in spec_by_id
-            and float(item["metrics"]["cumulative_return"]) > 0
-        ),
-        key=lambda item: float(item["metrics"]["cumulative_return"]),
-        reverse=True,
-    )[:top_n]
-    if not ranked:
-        return pd.DataFrame(), {"reason": "回测结果中没有累计收益为正且可用于当日信号的策略", "strategies": []}
-
-    signal_config = {
-        **config,
-        "strategy": {**config["strategy"], "top_k": CACHE_TOP_K},
-    }
-    top50, calculation = selection_for_date(signal_config, selected_date)
-    stats, coverage = recommendation_history_stats(config, selected_date)
-    rows: list[dict[str, Any]] = []
-    for item in ranked:
-        spec = spec_by_id[item["strategy_id"]]
-        rank_limit = spec.fallback_entry_rank or spec.entry_rank
-        candidates: list[pd.Series] = []
-        for _, stock in top50.sort_values("rank").iterrows():
-            code = str(stock["ts_code"])
-            rank = int(stock["rank"])
-            if rank > rank_limit:
-                continue
-            streak = 1
-            if spec.consecutive_rank is not None:
-                streak = int(stats.get(code, {}).get(f"consecutive_top{spec.consecutive_rank}", 0))
-            if streak >= spec.consecutive_days:
-                candidates.append(stock)
-        if spec.fallback_entry_rank is not None:
-            candidates = candidates[:1]
-        for stock in candidates:
-            code = str(stock["ts_code"])
-            rows.append({
-                "ts_code": code,
-                "name": str(stock.get("name", code)),
-                "rank": int(stock["rank"]),
-                "total_score": float(stock["total_score"]),
-                "consecutive_top20": int(stats.get(code, {}).get("consecutive_top20", 0)),
-                "consecutive_top50": int(stats.get(code, {}).get("consecutive_top50", 0)),
-                "strategy_id": spec.strategy_id,
-                "strategy_name": spec.name,
-                "strategy_return": float(item["metrics"]["cumulative_return"]),
-            })
-    strategy_meta = [{
-        "strategy_id": item["strategy_id"],
-        "name": item["name"],
-        "cumulative_return": float(item["metrics"]["cumulative_return"]),
-    } for item in ranked]
-    if not rows:
-        return pd.DataFrame(), {
-            "reason": "保留的盈利策略在所选日期均没有满足入场条件的标的",
-            "strategies": strategy_meta, "suite": suite_path.parent.name,
-            "coverage": coverage, "calculation": calculation,
-        }
-    detail = pd.DataFrame(rows)
-    recommendations = detail.groupby(["ts_code", "name"], as_index=False).agg(
-        rank=("rank", "min"),
-        total_score=("total_score", "max"),
-        consecutive_top20=("consecutive_top20", "max"),
-        consecutive_top50=("consecutive_top50", "max"),
-        strategy_support_count=("strategy_id", "nunique"),
-        supporting_strategies=("strategy_name", lambda values: "；".join(dict.fromkeys(values))),
-        best_supporting_return=("strategy_return", "max"),
-        mean_supporting_return=("strategy_return", "mean"),
-    )
-    recommendations = recommendations.sort_values(
-        ["strategy_support_count", "rank", "total_score"],
-        ascending=[False, True, False], kind="stable",
-    ).reset_index(drop=True)
-    recommendations.insert(0, "joint_rank", recommendations.index + 1)
-    return recommendations, {
-        "reason": "", "strategies": strategy_meta, "suite": suite_path.parent.name,
-        "coverage": coverage, "calculation": calculation,
-    }
-
-
-def combined_signal_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return up to five lab and three suite strategies with positive stored returns."""
-    definitions: list[dict[str, Any]] = []
-    suite_root = resolve_path(
-        config, config.get("strategy_suite", {}).get("output_dir", "backtests/strategy_suite")
-    )
-    suite_paths = sorted(suite_root.glob("*/suite.json"), reverse=True)
-    latest_suite_name = suite_paths[0].parent.name if suite_paths else ""
-    pool_key = strategy_key(_top50_config(config))[:8]
-    lab_root = resolve_path(
-        config, config.get("strategy_lab", {}).get("output_dir", "backtests/strategy_lab")
-    )
-    lab_paths = []
-    for candidate in sorted(lab_root.glob("*/results.csv"), reverse=True):
-        if not candidate.parent.name.startswith(f"{latest_suite_name}_") or f"pool-{pool_key}" not in candidate.parent.name:
-            continue
-        progress_path = candidate.parent / "progress.json"
-        if not progress_path.exists() or json.loads(progress_path.read_text(encoding="utf-8")).get("status") == "completed":
-            lab_paths.append(candidate)
-    if lab_paths:
-        lab = pd.read_csv(lab_paths[0])
-        lab = lab[lab["cumulative_return"].gt(0)].sort_values("cumulative_return", ascending=False).head(5)
-        for _, row in lab.iterrows():
-            definitions.append({
-                "strategy_id": f"lab_{row['experiment_id']}", "source": "策略试验场盈利组",
-                "name": str(row["strategy_name"]), "entry_rank": int(row["entry_rank"]),
-                "consecutive_rank": int(row["entry_rank"]), "consecutive_days": 3,
-                "exit_rank": int(row["exit_rank"]),
-                "confirmation_days": int(row["confirmation_days"]),
-                "take_profit": float(row["take_profit"]),
-                "historical_return": float(row["cumulative_return"]),
-            })
-    if suite_paths:
-        suite = json.loads(suite_paths[0].read_text(encoding="utf-8"))
-        spec_by_id = {spec.strategy_id: spec for spec in STRATEGIES}
-        ranked = sorted(
-            (item for item in suite.get("strategies", [])
-             if item.get("strategy_id") in spec_by_id
-             and float(item["metrics"]["cumulative_return"]) > 0),
-            key=lambda item: float(item["metrics"]["cumulative_return"]), reverse=True,
-        )[:3]
-        for item in ranked:
-            spec = spec_by_id[item["strategy_id"]]
-            definitions.append({
-                "strategy_id": spec.strategy_id, "source": "原策略盈利组",
-                "name": spec.name, "entry_rank": spec.entry_rank,
-                "consecutive_rank": spec.consecutive_rank,
-                "consecutive_days": spec.consecutive_days, "exit_rank": spec.exit_rank,
-                "confirmation_days": spec.exit_confirmation_days,
-                "take_profit": float(item["metrics"].get("take_profit_threshold") or 0.20),
-                "historical_return": float(item["metrics"]["cumulative_return"]),
-            })
-    return definitions
-
-
-def _ranking_context(
-    config: dict[str, Any], selected_date: date,
-) -> tuple[list[date], dict[date, dict[str, int]]]:
-    store = build_store(config)
-    cache = SelectionCache(store.root / "selection_results.sqlite3")
-    history = cache.history(
-        strategy_key(_top50_config(config)), RECOMMENDATION_HISTORY_START, selected_date,
-    )
-    dates = sorted(history["trade_date"].unique()) if not history.empty else []
-    by_date = {
-        trade_date: day.set_index("ts_code")["rank"].astype(int).to_dict()
-        for trade_date, day in history.groupby("trade_date")
-    }
-    return dates, by_date
-
-
-def _consecutive_inside(
-    dates: list[date], by_date: dict[date, dict[str, int]], code: str, threshold: int,
-) -> int:
-    count = 0
-    for trade_date in reversed(dates):
-        if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) <= threshold:
-            count += 1
-        else:
-            break
-    return count
-
-
-def _consecutive_outside(
-    dates: list[date], by_date: dict[date, dict[str, int]], code: str, threshold: int,
-) -> int:
-    count = 0
-    for trade_date in reversed(dates):
-        if by_date.get(trade_date, {}).get(code, CACHE_TOP_K + 1) > threshold:
-            count += 1
-        else:
-            break
-    return count
-
-
-def combined_signal_recommendations(
-    config: dict[str, Any], selected_date: date,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Aggregate current entries from historically positive stored strategies."""
-    definitions = combined_signal_definitions(config)
-    if not definitions:
-        return pd.DataFrame(), {
-            "reason": "当前历史结果中没有累计收益为正的策略；不生成联合买入候选。",
-            "strategies": definitions,
-        }
-    signal_config = {**config, "strategy": {**config["strategy"], "top_k": CACHE_TOP_K}}
-    top50, calculation = selection_for_date(signal_config, selected_date)
-    dates, by_date = _ranking_context(config, selected_date)
-    rows: list[dict[str, Any]] = []
-    for definition in definitions:
-        required_rank = definition["consecutive_rank"]
-        for _, stock in top50.loc[top50["rank"].le(definition["entry_rank"])].iterrows():
-            code = str(stock["ts_code"])
-            streak = (
-                1 if required_rank is None
-                else _consecutive_inside(dates, by_date, code, int(required_rank))
-            )
-            if streak < int(definition["consecutive_days"]):
-                continue
-            rows.append({
-                "ts_code": code, "name": str(stock.get("name", code)),
-                "rank": int(stock["rank"]), "total_score": float(stock["total_score"]),
-                "close": float(stock["close"]),
-                "consecutive_entry_days": streak, "strategy_id": definition["strategy_id"],
-                "strategy_name": definition["name"], "strategy_source": definition["source"],
-                "strategy_return": definition["historical_return"],
-            })
-    metadata = {"reason": "", "strategies": definitions, "calculation": calculation}
-    if not rows:
-        metadata["reason"] = "当前保留策略在所选日期均没有满足新开仓条件的股票。"
-        return pd.DataFrame(), metadata
-    detail = pd.DataFrame(rows)
-    recommendations = detail.groupby(["ts_code", "name"], as_index=False).agg(
-        rank=("rank", "min"), total_score=("total_score", "max"), close=("close", "max"),
-        consecutive_entry_days=("consecutive_entry_days", "max"),
-        strategy_support_count=("strategy_id", "nunique"),
-        supporting_strategies=("strategy_name", lambda values: "；".join(dict.fromkeys(values))),
-        best_supporting_return=("strategy_return", "max"),
-    ).sort_values(
-        ["strategy_support_count", "rank", "total_score"], ascending=[False, True, False],
-        kind="stable",
-    ).reset_index(drop=True)
-    recommendations.insert(0, "joint_rank", recommendations.index + 1)
-    return recommendations, metadata
-
-
-def stock_signal_reminders(
-    config: dict[str, Any], selected_date: date, ts_code: str,
-    entry_price: float, price_stop_loss: float,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Evaluate eight strategy exits, profit targets and an auxiliary price stop."""
-    definitions = combined_signal_definitions(config)
-    dates, by_date = _ranking_context(config, selected_date)
-    current_rank = by_date.get(selected_date, {}).get(ts_code, CACHE_TOP_K + 1)
-    store = build_store(config)
-    daily = store.load_daily()
-    market = daily[
-        daily["trade_date"].dt.date.eq(selected_date) & daily["ts_code"].eq(ts_code)
-    ]
-    if market.empty:
-        raise ValueError(f"{selected_date} 没有 {ts_code} 的日线行情")
-    row = market.iloc[-1]
-    day_high, day_low, close = float(row["high"]), float(row["low"]), float(row["close"])
-    price_stop = entry_price * (1 - price_stop_loss)
-    price_stop_met = day_low <= price_stop
-    records = []
-    for definition in definitions:
-        required_rank = definition["consecutive_rank"]
-        entry_streak = (
-            1 if required_rank is None
-            else _consecutive_inside(dates, by_date, ts_code, int(required_rank))
-        )
-        entry_met = current_rank <= definition["entry_rank"] and entry_streak >= definition["consecutive_days"]
-        exit_streak = _consecutive_outside(dates, by_date, ts_code, definition["exit_rank"])
-        rank_exit_met = exit_streak >= definition["confirmation_days"]
-        profit_price = entry_price * (1 + definition["take_profit"])
-        profit_met = day_high >= profit_price
-        records.append({
-            "strategy_name": definition["name"], "source": definition["source"],
-            "historical_return": definition["historical_return"], "current_rank": current_rank,
-            "entry_condition": entry_met, "entry_streak": entry_streak,
-            "take_profit_rate": definition["take_profit"], "take_profit_price": profit_price,
-            "take_profit_met": profit_met, "exit_rank": definition["exit_rank"],
-            "required_exit_confirmations": definition["confirmation_days"],
-            "current_exit_streak": exit_streak, "rank_exit_met": rank_exit_met,
-            "signal": "止盈" if profit_met else "策略退出" if rank_exit_met else "价格止损预警" if price_stop_met else "买入条件满足" if entry_met else "继续观察",
-        })
-    return pd.DataFrame(records), {
-        "trade_date": selected_date, "ts_code": ts_code, "open": float(row["open"]),
-        "high": day_high, "low": day_low, "close": close, "entry_price": entry_price,
-        "price_change_from_entry": close / entry_price - 1, "price_stop_loss": price_stop_loss,
-        "price_stop": price_stop, "price_stop_met": price_stop_met,
-    }
-
-
-def run_recent_signal_ensemble(
-    config: dict[str, Any], months: int = 3, end_date: date | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    """Backtest historically positive signals as equal-capital independent sleeves."""
-    if months <= 0:
-        raise ValueError("回测月数必须大于0")
-    definitions = combined_signal_definitions(config)
-    if not definitions:
-        raise RuntimeError("当前没有累计收益为正的策略可用于联合回测")
-    store = build_store(config)
-    daily = store.load_daily()
-    if daily.empty:
-        raise RuntimeError("本地没有日线数据")
-    end = min(end_date or date.today(), daily["trade_date"].max().date())
-    start = (pd.Timestamp(end) - pd.DateOffset(months=months)).date()
-    signal_start = start - timedelta(days=30)
-    warm_recommendation_cache(config, signal_start, end)
-    cache = SelectionCache(store.root / "selection_results.sqlite3")
-    rankings = cache.history(strategy_key(_top50_config(config)), signal_start, end)
-    basic = store.load_basic()
-    names = (
-        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
-        .set_index("ts_code")["name"].astype(str).to_dict()
-        if "name" in basic else {}
-    )
-    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
-        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
-        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
-        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
-        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
-
-    initial_cash = float(config["backtest"]["initial_cash"])
-    sleeve_cash = initial_cash / len(definitions)
-    component_daily: list[pd.DataFrame] = []
-    component_summaries: list[dict[str, Any]] = []
-    benchmark = store.load_market_dataset("benchmark")
-    limits = store.load_market_dataset("limit")
-    for definition in definitions:
-        spec = StrategySpec(
-            strategy_id=definition["strategy_id"], name=definition["name"],
-            description=f"正收益策略联合中的独立资金子账户：{definition['source']}",
-            entry_rank=int(definition["entry_rank"]), exit_rank=int(definition["exit_rank"]),
-            consecutive_rank=(
-                int(definition["consecutive_rank"])
-                if definition["consecutive_rank"] is not None else None
-            ),
-            consecutive_days=int(definition["consecutive_days"]), weighting="equal",
-            exit_confirmation_days=int(definition["confirmation_days"]),
-        )
-        result, trades, _, metrics = run_event_strategy(
-            daily, rankings, names, spec, start, end, sleeve_cash,
-            config["backtest"]["cost"], take_profit=float(definition["take_profit"]),
-            record_profit=float(definition["take_profit"]),
-            benchmark_daily=benchmark,
-            limit_daily=limits,
-        )
-        component = result[[
-            "trade_date", "equity_value", "benchmark_return", "turnover",
-            "transaction_cost", "rebalanced", "holdings",
-        ]].copy().set_index("trade_date")
-        component.columns = pd.MultiIndex.from_product([[definition["strategy_id"]], component.columns])
-        component_daily.append(component)
-        component_summaries.append({
-            **definition,
-            "recent_cumulative_return": metrics["cumulative_return"],
-            "recent_annualized_return": metrics["annualized_return"],
-            "recent_sharpe_ratio": metrics["sharpe_ratio"],
-            "recent_max_drawdown": metrics["max_drawdown"],
-            "recent_trade_count": metrics["total_trade_count"],
-            "recent_trade_win_rate": metrics["profitable_trade_rate"],
-            "recent_open_positions": int(trades["status"].eq("持有中").sum()) if not trades.empty else 0,
-        })
-
-    combined = pd.concat(component_daily, axis=1).sort_index()
-    value_columns = [column for column in combined if column[1] == "equity_value"]
-    equity_value = combined[value_columns].sum(axis=1)
-    previous_value = equity_value.shift(1).fillna(initial_cash)
-    net_return = equity_value / previous_value - 1
-    benchmark_columns = [column for column in combined if column[1] == "benchmark_return"]
-    benchmark_return = combined[benchmark_columns[0]]
-    rebalanced_columns = [column for column in combined if column[1] == "rebalanced"]
-    holding_columns = [column for column in combined if column[1] == "holdings"]
-    turnover_value = pd.Series(0.0, index=combined.index)
-    cost_value = pd.Series(0.0, index=combined.index)
-    for definition in definitions:
-        strategy_id = definition["strategy_id"]
-        prior_sleeve_value = combined[(strategy_id, "equity_value")].shift(1).fillna(sleeve_cash)
-        turnover_value += combined[(strategy_id, "turnover")] * prior_sleeve_value
-        cost_value += combined[(strategy_id, "transaction_cost")] * prior_sleeve_value
-    ensemble = pd.DataFrame({
-        "trade_date": combined.index, "signal_date": combined.index,
-        "gross_return": (equity_value + cost_value) / previous_value - 1,
-        "net_return": net_return, "benchmark_return": benchmark_return,
-        "turnover": turnover_value / previous_value,
-        "transaction_cost": cost_value / previous_value,
-        "holdings": combined[holding_columns].sum(axis=1),
-        "rebalanced": combined[rebalanced_columns].any(axis=1),
-        "equity_value": equity_value,
-    }).reset_index(drop=True)
-    ensemble["equity"] = ensemble["equity_value"] / initial_cash
-    ensemble["benchmark_equity"] = (1 + ensemble["benchmark_return"]).cumprod()
-    ensemble["drawdown"] = ensemble["equity"] / ensemble["equity"].cummax() - 1
-    metrics = calculate_metrics(ensemble)
-    metrics.update({
-        "strategy_id": "positive_strategy_equal_sleeves_recent",
-        "strategy_name": "正收益策略联合（等资金子账户）最近三个月",
-        "strategy_description": f"{len(definitions)}套历史正收益策略等额分配初始资金并独立执行。",
-        "requested_months": months, "start_date": start.isoformat(), "end_date": end.isoformat(),
-        "component_count": len(definitions), "selection_bias_warning": (
-            "策略由包含本区间的历史结果筛选，本结果是近期稳定性复测，不是严格样本外测试。"
-        ),
-    })
-    output = resolve_path(config, "backtests/signal_ensemble") / f"{start}_{end}"
-    output.mkdir(parents=True, exist_ok=True)
-    daily_path = output / "daily.csv"
-    components_path = output / "components.csv"
-    metrics_path = output / "metrics.json"
-    ensemble.to_csv(daily_path, index=False, encoding="utf-8-sig", float_format="%.8f")
-    pd.DataFrame(component_summaries).sort_values(
-        "recent_cumulative_return", ascending=False,
-    ).to_csv(components_path, index=False, encoding="utf-8-sig", float_format="%.8f")
-    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-    return metrics_path, metrics
 def warm_recommendation_cache(
     config: dict[str, Any], start_date: date = RECOMMENDATION_HISTORY_START,
     end_date: date | None = None,
@@ -700,87 +255,6 @@ def warm_recommendation_cache(
         "trading_days": len(dates), "newly_cached_days": len(missing),
         "already_cached_days": len(dates) - len(missing),
     }
-
-
-def run_historical_backtest(
-    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None
-) -> tuple[dict[str, Path], dict[str, Any]]:
-    settings = config["backtest"]
-    start = start_date or date.fromisoformat(settings["start_date"])
-    configured_end = settings.get("end_date")
-    end = end_date or (date.fromisoformat(configured_end) if configured_end else date.today())
-    if start >= end:
-        raise ValueError("回测开始日期必须早于结束日期")
-    # Extra observations are required before start for rolling factor windows.
-    store = run_update(config, end_date=end, start_date=start - timedelta(days=120))
-    daily = store.load_daily()
-    daily = daily[daily["trade_date"].dt.date <= end]
-    result = execute_backtest(
-        daily, store.load_basic(), config, start, end,
-        store.load_market_dataset("benchmark"), store.load_market_dataset("limit"),
-    )
-    folder_name = f"{start}_{end}"
-    profile_id = config["strategy"].get("profile_id")
-    if profile_id:
-        folder_name = f"{profile_id}_{folder_name}"
-    folder = resolve_path(config, settings["output_dir"]) / folder_name
-    paths = write_backtest_report(result, folder)
-    LOGGER.info("回测完成: %s", folder)
-    return paths, result.metrics
-
-
-def run_streak2_leader_backtest(
-    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    """Run the exact-two-day Top20 leader strategy against local point-in-time signals."""
-    store = build_store(config)
-    daily = store.load_daily()
-    if daily.empty:
-        raise RuntimeError("本地没有日线数据，请先运行每日更新")
-    local_end = daily["trade_date"].max().date()
-    end = min(end_date or local_end, local_end)
-    start = start_date or RECOMMENDATION_HISTORY_START
-    if start >= end:
-        raise ValueError("回测开始日期必须早于本地最新交易日")
-    warm_recommendation_cache(config, RECOMMENDATION_HISTORY_START, end)
-    cache = SelectionCache(store.root / "selection_results.sqlite3")
-    rankings = cache.history(
-        strategy_key(_top50_config(config)), RECOMMENDATION_HISTORY_START, end,
-    )
-    basic = store.load_basic()
-    names = (
-        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
-        .set_index("ts_code")["name"].astype(str).to_dict()
-        if "name" in basic else {}
-    )
-    excluded_st_count = 0
-    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
-        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
-        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
-        excluded_st_count = len(st_codes)
-        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
-        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
-    spec = next(
-        item for item in STRATEGIES
-        if item.strategy_id == "s14_top20_exact2_leader_full"
-    )
-    result, trades, events, metrics = run_event_strategy(
-        daily, rankings, names, spec, start, end,
-        float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],
-        take_profit=0.32, record_profit=0.32,
-        benchmark_daily=store.load_market_dataset("benchmark"),
-        limit_daily=store.load_market_dataset("limit"),
-    )
-    metrics.update({
-        "threshold_enabled": True,
-        "st_filter_mode": "current_name_approximation",
-        "excluded_st_count": excluded_st_count,
-        "signal_execution": "收盘确认信号，下一交易日开盘执行",
-    })
-    output = resolve_path(config, "backtests/streak2_leader") / f"{start}_{end}"
-    write_strategy_result(output, result, trades, events, metrics)
-    LOGGER.info("连续2次Top20领跑者策略回测完成: %s", output)
-    return output, metrics
 
 
 def run_strategy_suite(
@@ -832,33 +306,6 @@ def run_strategy_suite(
     summaries: list[dict[str, Any]] = []
     benchmark = store.load_market_dataset("benchmark")
     limits = store.load_market_dataset("limit")
-    baseline = execute_backtest(daily, basic, config, start, end, benchmark, limits)
-    baseline.metrics.update({
-        "strategy_id": "baseline_top10_3d",
-        "strategy_name": "基准：Top10线性权重，每3日调仓",
-        "strategy_description": "固定持有Top10并按排名线性分配权重，每3个交易日重新选股调仓。",
-        "threshold_enabled": False, "take_profit_count": 0,
-        "crossed_20_count": 0, "completed_trades": int(len(baseline.trades)),
-        "total_trade_count": None, "profitable_trade_count": None,
-        "losing_trade_count": None, "flat_trade_count": None,
-        "open_positions": int(baseline.daily["holdings"].iloc[-1]),
-        "average_holding_days": 0.0, "profitable_trade_rate": None,
-        "st_filter_mode": "current_name_approximation",
-        "excluded_st_count": len(st_codes),
-    })
-    baseline_folder = root / "baseline_top10_3d"
-    write_strategy_result(
-        baseline_folder, baseline.daily, baseline.trades, pd.DataFrame(), baseline.metrics,
-    )
-    summaries.append({
-        "strategy_id": "baseline_top10_3d", "name": baseline.metrics["strategy_name"],
-        "description": baseline.metrics["strategy_description"],
-        "folder": "baseline_top10_3d", "metrics": baseline.metrics,
-    })
-    LOGGER.info(
-        "基准回测完成: %s | 累计收益 %.2f%%",
-        baseline.metrics["strategy_name"], baseline.metrics["cumulative_return"] * 100,
-    )
     for spec in STRATEGIES:
         effective_take_profit = (
             spec.fixed_take_profit if spec.fixed_take_profit is not None else take_profit
@@ -880,103 +327,54 @@ def run_strategy_suite(
             "metrics": metrics,
         })
         LOGGER.info("策略回测完成: %s | 累计收益 %.2f%%", spec.name, metrics["cumulative_return"] * 100)
-    sweep_rows: list[dict[str, Any]] = []
-    raw_thresholds = settings.get("take_profit_sweep", [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, None])
-    thresholds = [None if value is None else float(value) for value in raw_thresholds]
-    for spec in BASE_STRATEGIES:
-        for threshold in thresholds:
-            _, sweep_trades, _, sweep_metrics = run_event_strategy(
-                daily, rankings, names, spec, start, end, initial_cash, costs,
-                take_profit=threshold, record_profit=threshold, benchmark_daily=benchmark,
-                limit_daily=limits,
-            )
-            sweep_rows.append({
-                "strategy_id": spec.strategy_id,
-                "strategy_name": spec.name,
-                "take_profit_threshold": threshold,
-                "threshold_label": "不设止盈" if threshold is None else f"{threshold:.0%}",
-                "cumulative_return": sweep_metrics["cumulative_return"],
-                "annualized_return": sweep_metrics["annualized_return"],
-                "sharpe_ratio": sweep_metrics["sharpe_ratio"],
-                "max_drawdown": sweep_metrics["max_drawdown"],
-                "total_trade_count": sweep_metrics["total_trade_count"],
-                "profitable_trade_rate": sweep_metrics["profitable_trade_rate"],
-                "average_winner_return": sweep_metrics["average_winner_return"],
-                "average_loser_return": sweep_metrics["average_loser_return"],
-                "take_profit_count": sweep_metrics["take_profit_count"],
-                "open_positions": int(sweep_trades["status"].eq("持有中").sum()) if not sweep_trades.empty else 0,
-            })
-    sweep = pd.DataFrame(sweep_rows)
-    sweep_path = root / "take_profit_sweep.csv"
-    sweep.to_csv(sweep_path, index=False, encoding="utf-8-sig", float_format="%.8f")
-    threshold_summary = []
-    for label, group in sweep.groupby("threshold_label", sort=False):
-        threshold_summary.append({
-            "threshold": label,
-            "mean_cumulative_return": float(group["cumulative_return"].mean()),
-            "median_cumulative_return": float(group["cumulative_return"].median()),
-            "positive_strategy_count": int(group["cumulative_return"].gt(0).sum()),
-            "mean_max_drawdown": float(group["max_drawdown"].mean()),
+    signal_dates = [value for value in sorted(daily["trade_date"].unique()) if pd.Timestamp(value).date() < start]
+    signal_start = pd.Timestamp(signal_dates[-1]).date() if signal_dates else start
+    focus_signals = build_priority_signal_history(
+        daily,
+        store.load_market_dataset("daily_basic"),
+        basic,
+        config["low_position_pool"],
+        config["market"],
+        signal_start,
+        end,
+    )
+    focus_settings = config.get("smallcap_focus_backtest", {})
+    focus_initial_cash = float(focus_settings.get("initial_cash", 10_000))
+    focus_take_profit = float(focus_settings.get("take_profit", 0.40))
+    focus_stop_loss = float(focus_settings.get("stop_loss", 0.10))
+    focus_non_up_days = int(focus_settings.get("non_up_exit_days", 2))
+    for spec in LOW_POSITION_STRATEGIES:
+        result, trades, events, metrics = run_low_position_strategy(
+            daily,
+            focus_signals,
+            names,
+            spec,
+            start,
+            end,
+            focus_initial_cash,
+            costs,
+            take_profit=focus_take_profit,
+            stop_loss=focus_stop_loss,
+            non_up_exit_days=focus_non_up_days,
+            benchmark_daily=benchmark,
+            limit_daily=limits,
+        )
+        metrics["st_filter_mode"] = "current_name_approximation"
+        metrics["excluded_st_count"] = len(st_codes)
+        folder = root / spec.strategy_id
+        write_strategy_result(folder, result, trades, events, metrics)
+        summaries.append({
+            "strategy_id": spec.strategy_id,
+            "name": spec.name,
+            "description": spec.description,
+            "folder": spec.strategy_id,
+            "metrics": metrics,
         })
+        LOGGER.info("策略回测完成: %s | 累计收益 %.2f%%", spec.name, metrics["cumulative_return"] * 100)
     index_path = write_suite_index(root, start, end, summaries, {
         "st_filter": {"mode": "current_name_approximation", "excluded_count": len(st_codes)},
         "trading_constraints": "开盘涨停不买、开盘跌停不卖",
-        "take_profit_sweep_file": sweep_path.name,
-        "take_profit_sweep_summary": threshold_summary,
+        "smallcap_focus_signal_count": int(len(focus_signals)),
     })
     LOGGER.info("多策略回测汇总: %s", index_path)
     return index_path, summaries
-
-
-def run_strategy_lab(
-    config: dict[str, Any], start_date: date | None = None, end_date: date | None = None,
-) -> tuple[Path, pd.DataFrame]:
-    """Run the best-strategy ablation grid entirely from local cached data."""
-    settings = config.get("strategy_lab", {})
-    suite_settings = config.get("strategy_suite", {})
-    start = start_date or date.fromisoformat(
-        settings.get("start_date", suite_settings.get("start_date", "2025-09-01"))
-    )
-    configured_end = settings.get("end_date")
-    requested_end = end_date or (
-        date.fromisoformat(configured_end) if configured_end else date.today()
-    )
-    store = build_store(config)
-    daily = store.load_daily()
-    if daily.empty:
-        raise RuntimeError("本地没有日线数据，请先运行每日更新")
-    end = min(requested_end, daily["trade_date"].max().date())
-    if start >= end:
-        raise ValueError("策略试验场开始日期必须早于本地最新交易日")
-    warm_recommendation_cache(config, start, end)
-    cache = SelectionCache(store.root / "selection_results.sqlite3")
-    rankings = cache.history(strategy_key(_top50_config(config)), start, end)
-    expected_dates = {
-        pd.Timestamp(value).date() for value in daily["trade_date"].unique()
-        if start <= pd.Timestamp(value).date() <= end
-    }
-    if set(rankings["trade_date"].unique()) != expected_dates:
-        raise RuntimeError("策略试验场所需的 Top-50 历史信号缓存不完整")
-    basic = store.load_basic()
-    names = (
-        basic.dropna(subset=["name"]).drop_duplicates("ts_code")
-        .set_index("ts_code")["name"].astype(str).to_dict()
-        if "name" in basic else {}
-    )
-    if config.get("market", {}).get("exclude_st", True) and "name" in basic:
-        st_mask = basic["name"].fillna("").astype(str).str.upper().str.contains("ST")
-        st_codes = set(basic.loc[st_mask, "ts_code"].astype(str))
-        daily = daily[~daily["ts_code"].isin(st_codes)].copy()
-        rankings = rankings[~rankings["ts_code"].isin(st_codes)].copy()
-    cost_key = hashlib.sha256(
-        json.dumps(config["backtest"]["cost"], sort_keys=True).encode("utf-8")
-    ).hexdigest()[:8]
-    output = resolve_path(
-        config, settings.get("output_dir", "backtests/strategy_lab")
-    ) / f"{start}_{end}_cost-{cost_key}_pool-{strategy_key(_top50_config(config))[:8]}"
-    return run_experiments(
-        daily, rankings, names, start, end,
-        float(config["backtest"]["initial_cash"]), config["backtest"]["cost"],
-        settings, output, benchmark_daily=store.load_market_dataset("benchmark"),
-        limit_daily=store.load_market_dataset("limit"),
-    )

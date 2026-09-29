@@ -4,8 +4,8 @@ import argparse
 import logging
 from datetime import date
 
-from .config import apply_strategy_profile, load_config
-from .pipeline import run_daily, run_historical_backtest, run_update
+from .config import load_config
+from .pipeline import run_daily, run_update
 
 
 def _date(value: str) -> date:
@@ -30,29 +30,12 @@ def main() -> None:
     daily.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     daily.add_argument("--end", type=_date)
     daily.add_argument("--top-k", type=_top_k, help="临时覆盖推荐数量（1-50）")
-    daily.add_argument("--profile", help="策略配置，例如 recent_defensive")
-    backtest = subparsers.add_parser("backtest", help="执行历史 Top-K 回测")
-    backtest.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
-    backtest.add_argument("--start", type=_date)
-    backtest.add_argument("--end", type=_date)
-    backtest.add_argument("--profile", help="策略配置，例如 recent_defensive")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     config = load_config(args.config)
-    if getattr(args, "profile", None):
-        config = apply_strategy_profile(config, args.profile)
     if args.command == "update":
         store = run_update(config, args.end)
         print(f"数据目录: {store.root}")
-        return
-    if args.command == "backtest":
-        paths, metrics = run_historical_backtest(config, args.start, args.end)
-        print(f"累计收益: {metrics['cumulative_return']:.2%}")
-        print(f"基准收益: {metrics['benchmark_return']:.2%}")
-        print(f"年化收益: {metrics['annualized_return']:.2%}")
-        print(f"最大回撤: {metrics['max_drawdown']:.2%}")
-        print(f"回测指标: {paths['metrics']}")
-        print(f"净值图: {paths['plot']}")
         return
     if args.top_k is not None:
         config["strategy"]["top_k"] = args.top_k

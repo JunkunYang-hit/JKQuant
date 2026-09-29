@@ -23,9 +23,45 @@ market:
   universe: all_a
   exclude_st: true  # 使用 Tushare 当前简称过滤；历史时点 ST 仍需专门数据还原
   exclude_star_market: true  # 科创板需单独交易权限：不纳入推荐、信号或新回测
-  exclude_chinext_market: true  # 创业板也需单独交易权限；当前账户不可买入
+  exclude_chinext_market: true  # 创业板需单独交易权限；当前配置不纳入选股
+  exclude_bse_market: true  # 北交所同样需要单独权限；不纳入推荐、重点观察和回测
   min_list_days: 120
   min_amount: 20000  # 千元，与 Tushare daily.amount 单位一致
+
+# 小盘低位启动池：先看信号日前的低位/横盘状态，再检查当日放量大阳线。
+low_position_pool:
+  main_board_only: true  # 只保留普通沪深主板，不含任何需要单独开通权限的板块
+  lookback_days: 250
+  consolidation_days: 20
+  min_history_days: 120
+  min_circ_mv_yi: 10
+  max_circ_mv_yi: 100
+  min_price: 3.0  # 低于3元不进入备选池
+  max_price: 25.0  # 高于25元不进入备选池
+  max_low_position: 0.45  # 低位是入池方式之一，不再是必须条件
+  max_prior_return_60: 0.10  # 或者此前60日涨幅不超过10%
+  max_prior_return_120: 0.20  # 且此前120日涨幅不超过20%，视作此前未明显上涨
+  max_consolidation_range: 0.20
+  max_prior_volatility: 0.40
+  min_volume_ratio: 2.0
+  min_previous_day_volume_ratio: 1.0  # 红色重点观察：累计成交量必须至少达到上一交易日全天成交量
+  min_amount_ratio: 1.8
+  min_daily_return: 0.05
+  min_body_pct: 0.04
+  min_close_location: 0.75
+  pool_min_turnover_rate: 0.5
+  min_turnover_rate: 3.0
+  max_turnover_rate: 25.0
+  # 盘中研究雷达：按已过去的交易分钟折算全天量能速度，橙色条件比红色重点观察更早。
+  live_min_elapsed_minutes: 30
+  early_volume_pace: 1.5
+  early_amount_pace: 1.4
+  early_daily_return: 0.03
+  early_body_pct: 0.02
+  early_close_location: 0.65
+  early_turnover_pace: 2.0
+  min_amount: 20000
+  max_pool_size: 300
 
 strategy:
   top_k: 20  # 默认推荐数量，可设 1-50；运行时可用 --top-k 临时覆盖
@@ -44,40 +80,12 @@ strategy:
     risk: 0.20
     liquidity: 0.15
 
-strategy_profiles:
-  baseline:
-    name: 原固定权重
-    description: 动量40%、趋势25%、低风险20%、流动性15%，保留作为基准对照。
-  recent_defensive:
-    name: 近期低波动防守（研究）
-    description: 根据最近252交易日诊断降低趋势与动量权重，重点使用低波动；只作为新策略对照，不覆盖原策略。
-    category_weights:
-      momentum: 0.10
-      trend: 0.10
-      risk: 0.70
-      liquidity: 0.10
-    factor_weights:
-      return_5d: 0.70
-      return_20d: 0.30
-      close_ma20: 0.50
-      ma5_ma20: 0.50
-      volatility_20d: 0.90
-      max_drawdown_20d: 0.10
-      amount_mean_20d: 0.25
-      amount_ratio_5_20: 0.75
-
 report:
   output_dir: reports
 
 backtest:
-  start_date: "2025-01-01"
-  end_date: null  # null 表示截至本地最新交易日
-  top_k: 10  # 持有排名前 10 的股票
-  weighting: rank_linear  # 排名线性加权：第 1 名权重最高，第 10 名最低
-  rebalance_days: 3
   initial_cash: 1000000
   benchmark: 510300.SH
-  output_dir: backtests
   cost:
     commission_buy: 0.0005
     commission_sell: 0.0005
@@ -86,24 +94,17 @@ backtest:
     slippage: 0.0005
 
 strategy_suite:
-  start_date: "2025-09-01"
+  start_date: "2026-01-01"
   end_date: null
   output_dir: backtests/strategy_suite
   take_profit: 0.20
   record_profit: 0.20
-  # 用原始 11 套策略横向测试止盈；null 表示不设固定止盈。
-  take_profit_sweep: [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, null]
 
-strategy_lab:
-  start_date: "2025-09-01"
-  end_date: null
-  output_dir: backtests/strategy_lab
-  take_profit_start: 0.20
-  take_profit_end: 0.40
-  take_profit_step: 0.02
-  confirmation_days: [1, 2, 3]
-  entry_ranks: [20, 25]
-  exit_ranks: [10, 15, 20, 25]
+smallcap_focus_backtest:
+  initial_cash: 10000
+  take_profit: 0.25
+  stop_loss: 0.10
+  non_up_exit_days: 2
 
 ai:
   provider: deepseek
@@ -117,3 +118,15 @@ ai:
   timeout_seconds: 180
   max_retries: 2
   cache_file: ai_analysis.sqlite3
+
+# WebUI盘中监控。默认使用通达信；也可切换Tushare rt_k（需另购实时权限）。
+intraday:
+  enabled: true  # 只启用WebUI实时监控入口；不会自动请求、不会写入历史日线
+  provider: tdxquant
+  refresh_seconds: 30
+  tdxquant:
+    base_url: http://127.0.0.1:17709/
+    timeout_seconds: 3
+  tushare_rt:
+    token_env: TUSHARE_TOKEN
+    batch_size: 300

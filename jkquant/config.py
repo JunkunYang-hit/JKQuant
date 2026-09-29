@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from copy import deepcopy
 from typing import Any
 
 import yaml
@@ -29,22 +28,11 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("strategy.top_k 必须在 1 到 50 之间")
     if "backtest" in config:
         backtest = config["backtest"]
-        backtest_top_k = int(backtest["top_k"])
-        if not 1 <= backtest_top_k <= 50:
-            raise ValueError("backtest.top_k 必须在 1 到 50 之间")
-        if int(backtest["rebalance_days"]) <= 0:
-            raise ValueError("backtest.rebalance_days 必须大于 0")
-        if backtest.get("weighting", "equal") not in {"equal", "rank_linear"}:
-            raise ValueError("backtest.weighting 仅支持 equal 或 rank_linear")
         if float(backtest["initial_cash"]) <= 0:
             raise ValueError("backtest.initial_cash 必须大于 0")
         costs = backtest["cost"]
         if any(float(value) < 0 for value in costs.values()):
             raise ValueError("回测交易成本不能为负数")
-    for profile_id, profile in config.get("strategy_profiles", {}).items():
-        weights = profile.get("category_weights")
-        if weights and abs(sum(float(value) for value in weights.values()) - 1.0) > 1e-9:
-            raise ValueError(f"策略配置 {profile_id} 的类别权重之和必须为 1")
     if "strategy_suite" in config:
         suite = config["strategy_suite"]
         record_profit = float(suite.get("record_profit", 0.20))
@@ -69,6 +57,20 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError("ai.models 必须是非空模型名列表")
         if str(ai.get("model", "deepseek-flash")) not in models:
             raise ValueError("ai.model 必须包含在 ai.models 中")
+    if "low_position_pool" in config:
+        pool = config["low_position_pool"]
+        if float(pool.get("min_circ_mv_yi", 10)) >= float(pool.get("max_circ_mv_yi", 100)):
+            raise ValueError("low_position_pool 最小流通市值必须小于最大流通市值")
+        if float(pool.get("min_price", 3)) <= 0:
+            raise ValueError("low_position_pool.min_price 必须大于 0")
+        if float(pool.get("min_price", 3)) >= float(pool.get("max_price", 25)):
+            raise ValueError("low_position_pool 最低价格必须小于最高价格")
+        for key in ("max_low_position", "max_consolidation_range", "max_prior_volatility",
+                    "min_daily_return", "min_body_pct", "min_close_location"):
+            if not 0 <= float(pool[key]) <= 1:
+                raise ValueError(f"low_position_pool.{key} 必须在 0 到 1 之间")
+        if int(pool.get("max_pool_size", 300)) <= 0:
+            raise ValueError("low_position_pool.max_pool_size 必须大于 0")
 
 
 def resolve_path(config: dict[str, Any], value: str) -> Path:
@@ -76,23 +78,3 @@ def resolve_path(config: dict[str, Any], value: str) -> Path:
     if path.is_absolute():
         return path
     return Path(config["_config_dir"]) / path
-
-
-def apply_strategy_profile(config: dict[str, Any], profile_id: str) -> dict[str, Any]:
-    """Return an isolated config with one named scoring profile applied."""
-    profiles = config.get("strategy_profiles", {})
-    if profile_id not in profiles:
-        raise ValueError(f"未知策略配置：{profile_id}")
-    result = deepcopy(config)
-    profile = profiles[profile_id]
-    if profile_id == "baseline" and not profile.get("category_weights") and not profile.get("factor_weights"):
-        return result
-    if "category_weights" in profile:
-        result["strategy"]["category_weights"] = deepcopy(profile["category_weights"])
-    for factor, weight in profile.get("factor_weights", {}).items():
-        if factor not in result["strategy"]["factors"]:
-            raise ValueError(f"策略配置 {profile_id} 包含未知因子：{factor}")
-        result["strategy"]["factors"][factor]["weight"] = float(weight)
-    result["strategy"]["profile_id"] = profile_id
-    result["strategy"]["profile_name"] = profile.get("name", profile_id)
-    return result

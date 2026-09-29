@@ -25,47 +25,29 @@ class StrategySpec:
     exit_rank: int
     consecutive_rank: int | None
     consecutive_days: int
-    weighting: str
     exit_confirmation_days: int = 1
-    fallback_entry_rank: int | None = None
-    capital_fraction_per_entry: float | None = None
     max_positions: int | None = None
     fixed_take_profit: float | None = None
     exact_consecutive_days: bool = False
 
 
 STRATEGIES = [
-    StrategySpec("s01_top10_exit20", "Top10比例买入，跌出Top20卖出", "按排名线性加权买入Top10，跌出Top20卖出。", 10, 20, None, 1, "rank_linear"),
-    StrategySpec("s02_top5_exit20_confirm2", "Top5比例买入，跌出Top20卖出（两日确认）", "按排名线性加权买入Top5；首次跌出暂缓，连续两个信号日跌出Top20才卖出。", 5, 20, None, 1, "rank_linear", 2),
-    StrategySpec("s03_top50_streak3", "连续3次Top50，跌出Top50卖出", "连续3个交易日进入Top50后等权买入，跌出Top50卖出。", 50, 50, 50, 3, "equal"),
-    StrategySpec("s03_top50_streak3_confirm2", "连续3次Top50，跌出Top50卖出（两日确认）", "连续3个交易日进入Top50后等权买入；连续两个信号日跌出Top50才卖出。", 50, 50, 50, 3, "equal", 2),
-    StrategySpec("s04_top50_streak2", "连续2次Top50，跌出Top50卖出", "连续2个交易日进入Top50后等权买入，跌出Top50卖出。", 50, 50, 50, 2, "equal"),
-    StrategySpec("s04_top50_streak2_confirm2", "连续2次Top50，跌出Top50卖出（两日确认）", "连续2个交易日进入Top50后等权买入；连续两个信号日跌出Top50才卖出。", 50, 50, 50, 2, "equal", 2),
-    StrategySpec("s05_top20_streak3", "连续3次Top20，跌出Top20卖出", "连续3个交易日进入Top20后等权买入，跌出Top20卖出。", 20, 20, 20, 3, "equal"),
-    StrategySpec("s05_top20_streak3_confirm2", "连续3次Top20，跌出Top20卖出（两日确认）", "连续3个交易日进入Top20后等权买入；连续两个信号日跌出Top20才卖出。", 20, 20, 20, 3, "equal", 2),
-    StrategySpec("s06_top20_streak2_confirm2", "连续2次Top20，跌出Top20卖出（两日确认）", "连续2个交易日进入Top20后等权买入；连续两个信号日跌出Top20才卖出。", 20, 20, 20, 2, "equal", 2),
-    StrategySpec("s07_top10_streak2_exit20", "Top10且连续2次Top20，跌出Top20卖出", "按排名线性加权买入Top10且连续2次进入Top20的股票，跌出Top20卖出。", 10, 20, 20, 2, "rank_linear"),
-    StrategySpec("s08_top5_streak2_exit20_confirm2", "Top5且连续2次Top20，跌出Top20卖出（两日确认）", "按排名线性加权买入Top5且连续2次进入Top20的股票；连续两个信号日跌出Top20才卖出。", 5, 20, 20, 2, "rank_linear", 2),
-    StrategySpec("s10_top5_equal_exit10_confirm2", "当日Top5等权，跌出Top10卖出（两日确认）", "等权买入当日Top5；连续两个信号日跌出Top10才卖出。", 5, 10, None, 1, "equal", 2),
-    StrategySpec("s12_top1_streak3_half", "Top1且连续3次Top20，半仓买入", "只买当日Top1且连续3次进入Top20的股票；每次使用账户权益50%，最多持有2只；跌出Top20或盈利30%卖出。", 1, 20, 20, 3, "equal", 1, None, 0.5, 2, 0.30),
-    StrategySpec("s13_top1_fallback2_streak3_half", "Top1优先、Top2回退且连续3次Top20，半仓买入", "优先买当日Top1且连续3次进入Top20的股票；无可买Top1时检查Top2；每次使用账户权益50%，最多持有2只；跌出Top20或盈利30%卖出。", 1, 20, 20, 3, "equal", 1, 2, 0.5, 2, 0.30),
+    StrategySpec("s04_top50_streak2_confirm2", "连续2次Top50，跌出Top50卖出（两日确认）", "连续2个交易日进入Top50后等权买入；连续两个信号日跌出Top50才卖出。", 50, 50, 50, 2, 2),
+    StrategySpec("s04_top50_streak2", "连续2次Top50，跌出Top50卖出", "连续2个交易日进入Top50后等权买入，跌出Top50卖出。", 50, 50, 50, 2),
     StrategySpec(
         "s14_top20_exact2_leader_full", "连续2次Top20领跑者全仓策略",
         "在恰好连续2次进入Top20的股票中选择当日排名最靠前者全仓买入；下一信号日未完成第3次进入Top20则退出，完成后持有至跌出Top20或盈利32%卖出。",
-        20, 20, 20, 2, "equal", 1, None, None, 1, 0.32, True,
+        20, 20, 20, 2, 1, 1, 0.32, True,
     ),
+    StrategySpec("s03_top50_streak3_confirm2", "连续3次Top50，跌出Top50卖出（两日确认）", "连续3个交易日进入Top50后等权买入；连续两个信号日跌出Top50才卖出。", 50, 50, 50, 3, 2),
+    StrategySpec("s06_top20_streak2_confirm2", "连续2次Top20，跌出Top20卖出（两日确认）", "连续2个交易日进入Top20后等权买入；连续两个信号日跌出Top20才卖出。", 20, 20, 20, 2, 2),
 ]
-BASE_STRATEGIES = [spec for spec in STRATEGIES if not spec.strategy_id.endswith("_confirm2") and spec.fixed_take_profit is None]
 
 
-def _entry_weights(candidates: list[tuple[str, int]], spec: StrategySpec) -> dict[str, float]:
+def _entry_weights(candidates: list[tuple[str, int]]) -> dict[str, float]:
     if not candidates:
         return {}
-    if spec.weighting == "equal":
-        return {code: 1 / len(candidates) for code, _ in candidates}
-    raw = {code: float(spec.entry_rank + 1 - rank) for code, rank in candidates}
-    total = sum(raw.values())
-    return {code: value / total for code, value in raw.items()}
+    return {code: 1 / len(candidates) for code, _ in candidates}
 
 
 def _signal_snapshots(rankings: pd.DataFrame, spec: StrategySpec) -> dict[date, dict[str, Any]]:
@@ -223,14 +205,13 @@ def run_event_strategy(
             changed = True
 
         candidates: list[tuple[str, int]] = []
-        candidate_rank_limit = spec.fallback_entry_rank or spec.entry_rank
         for code, rank in sorted(ranks.items(), key=lambda item: item[1]):
             streak = streaks.get(code, 0)
             qualified_streak = (
                 spec.consecutive_rank is None
                 or (streak == spec.consecutive_days if spec.exact_consecutive_days else streak >= spec.consecutive_days)
             )
-            if not (rank <= candidate_rank_limit and qualified_streak and code not in positions and code not in profit_blocked and code in market.index):
+            if not (rank <= spec.entry_rank and qualified_streak and code not in positions and code not in profit_blocked and code in market.index):
                 continue
             open_price = float(market.at[code, "open"])
             pre_close = float(market.at[code, "pre_close"])
@@ -241,20 +222,12 @@ def run_event_strategy(
                 blocked_buys += 1
                 continue
             candidates.append((code, rank))
-        if spec.fallback_entry_rank is not None:
-            candidates = candidates[:1]
         if spec.max_positions is not None:
             available_slots = max(0, spec.max_positions - len(positions))
             candidates = candidates[:available_slots]
-        required_cash = (
-            previous_equity * spec.capital_fraction_per_entry
-            if spec.capital_fraction_per_entry is not None else previous_equity * 1e-8
-        )
-        if candidates and cash + 1e-8 >= required_cash:
-            allocations = _entry_weights(candidates, spec)
-            total_cash_budget = (
-                required_cash if spec.capital_fraction_per_entry is not None else cash
-            )
+        if candidates and cash > 0:
+            allocations = _entry_weights(candidates)
+            total_cash_budget = cash
             for code, rank in candidates:
                 open_price = float(market.at[code, "open"])
                 cash_budget = total_cash_budget * allocations[code]
@@ -348,23 +321,25 @@ def run_event_strategy(
         events_frame = events_frame.merge(outcomes, on="trade_id", how="left")
     metrics = calculate_metrics(result)
     closed = trades_frame[trades_frame.get("status", pd.Series(dtype=str)).eq("已平仓")]
+    profitable = closed["net_return"].gt(0) if "net_return" in closed else pd.Series(dtype=bool)
+    losing = closed["net_return"].lt(0) if "net_return" in closed else pd.Series(dtype=bool)
+    flat = closed["net_return"].eq(0) if "net_return" in closed else pd.Series(dtype=bool)
     metrics.update({
         "strategy_id": spec.strategy_id, "strategy_name": spec.name, "strategy_description": spec.description,
         "take_profit_threshold": take_profit, "exit_confirmation_days": spec.exit_confirmation_days,
-        "capital_fraction_per_entry": spec.capital_fraction_per_entry,
         "max_positions": spec.max_positions,
         "corporate_action_mode": "reinvest_proxy",
         "corporate_action_adjustment_count": corporate_action_adjustments,
         "take_profit_count": int(closed["exit_reason"].eq(take_profit_label).sum()) if not closed.empty else 0,
         "crossed_20_count": len(events_frame), "completed_trades": len(closed), "total_trade_count": len(closed),
-        "profitable_trade_count": int(closed["net_return"].gt(0).sum()) if not closed.empty else 0,
-        "losing_trade_count": int(closed["net_return"].lt(0).sum()) if not closed.empty else 0,
-        "flat_trade_count": int(closed["net_return"].eq(0).sum()) if not closed.empty else 0,
+        "profitable_trade_count": int(profitable.sum()),
+        "losing_trade_count": int(losing.sum()),
+        "flat_trade_count": int(flat.sum()),
         "open_positions": len(positions),
         "average_holding_days": float(closed["holding_trading_days"].mean()) if not closed.empty else 0.0,
-        "profitable_trade_rate": float(closed["net_return"].gt(0).mean()) if not closed.empty else 0.0,
-        "average_winner_return": float(closed.loc[closed["net_return"].gt(0), "net_return"].mean()) if closed["net_return"].gt(0).any() else 0.0,
-        "average_loser_return": float(closed.loc[closed["net_return"].lt(0), "net_return"].mean()) if closed["net_return"].lt(0).any() else 0.0,
+        "profitable_trade_rate": float(profitable.mean()) if not profitable.empty else 0.0,
+        "average_winner_return": float(closed.loc[profitable, "net_return"].mean()) if profitable.any() else 0.0,
+        "average_loser_return": float(closed.loc[losing, "net_return"].mean()) if losing.any() else 0.0,
         "limit_up_buy_blocked_count": int(result["limit_up_buy_blocked"].sum()),
         "limit_down_sell_blocked_count": int(result["limit_down_sell_blocked"].sum()),
         "take_profit_model": "不设固定止盈" if take_profit is None else f"日内最高价触及{take_profit:.0%}时按目标价卖出；开盘跳空越过时按开盘价",
